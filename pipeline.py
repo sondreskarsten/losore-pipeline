@@ -116,17 +116,25 @@ def download_enhetsregisteret():
 # ═══════════════════════════════════════════════════════════════
 # Stage 1: COLLECT — JSONL streaming, O(batch_size) memory
 #
-# Each line in raw_responses.jsonl is one JSON record:
-#   {"orgnr": "...", "url": "...", "collected_at": "...",
-#    "http_status": 200, "rsc_payload": "...",
-#    "rsc_payload_raw": null, "error": null}
+# Primary: RSC endpoint (Rsc: 1 header) → text/x-component
+#   - Returns flight stream directly, no HTML wrapper
+#   - No JS string unescape needed — lines are plain text
+#   - ~18% the size of full HTML response
+#   - Eliminates the escape-bug class entirely
 #
-# Only the data-bearing RSC payload is stored (the one
-# containing "rettsstiftelser":[). Page metadata payloads
-# are discarded.
+# Fallback: HTML parsing (self.__next_f.push extraction)
+#   - Used if RSC endpoint returns non-200 or wrong content-type
+#   - Requires regex extraction + json.loads JS unescape
 #
-# Memory during collection: only the set of already-scraped
-# orgnr keys (~10 bytes × N) plus the current batch buffer.
+# Record schema:
+#   orgnr            str
+#   url              str
+#   collected_at     ISO timestamp
+#   http_status      int | null
+#   rsc_payload      str (flight stream line or decoded push payload)
+#   rsc_payload_raw  str (undecoded push payload, fallback only)
+#   method           "rsc" | "html" | null
+#   error            str | null
 # ═══════════════════════════════════════════════════════════════
 
 def collect_one(orgnr):
@@ -138,8 +146,25 @@ def collect_one(orgnr):
         "http_status": None,
         "rsc_payload": None,
         "rsc_payload_raw": None,
+        "method": None,
         "error": None,
     }
+
+    try:
+        resp = requests.get(url, headers={"Rsc": "1"}, timeout=30)
+        record["http_status"] = resp.status_code
+        resp.raise_for_status()
+        if resp.headers.get("content-type", "").startswith("text/x-component"):
+            record["method"] = "rsc"
+            for line in resp.text.split('\n'):
+                if '"rettsstiftelser":[' in line:
+                    record["rsc_payload"] = line
+                    break
+            return record
+    except (requests.exceptions.RequestException,):
+        pass
+
+    record["method"] = "html"
     try:
         resp = requests.get(url, timeout=30)
         record["http_status"] = resp.status_code
