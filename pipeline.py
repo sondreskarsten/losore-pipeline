@@ -112,7 +112,10 @@ def scrape_losore(orgnr):
     pushes = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', resp.text, re.DOTALL)
 
     for payload in pushes:
-        p = payload.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
+        try:
+            p = json.loads('"' + payload + '"')
+        except (json.JSONDecodeError, ValueError):
+            continue
         if '"rettsstiftelser"' not in p:
             continue
 
