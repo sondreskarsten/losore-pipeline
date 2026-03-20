@@ -37,8 +37,8 @@ gcloud run jobs create "${JOB_NAME}" \
     --region="${REGION}" \
     --image="${IMAGE_URI}" \
     --service-account="${SA_EMAIL}" \
-    --task-timeout=4h \
-    --max-retries=1 \
+    --task-timeout=24h \
+    --max-retries=0 \
     --memory=1Gi \
     --cpu=1 \
     --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=${GCS_PREFIX},KOMMUNENUMMER=${KOMMUNENUMMER},SEARCH_TERMS=${SEARCH_TERMS}" \
@@ -48,8 +48,8 @@ gcloud run jobs update "${JOB_NAME}" \
     --region="${REGION}" \
     --image="${IMAGE_URI}" \
     --service-account="${SA_EMAIL}" \
-    --task-timeout=4h \
-    --max-retries=1 \
+    --task-timeout=24h \
+    --max-retries=0 \
     --memory=1Gi \
     --cpu=1 \
     --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=${GCS_PREFIX},KOMMUNENUMMER=${KOMMUNENUMMER},SEARCH_TERMS=${SEARCH_TERMS}"

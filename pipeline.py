@@ -35,7 +35,7 @@ DELAY = float(os.environ.get("SCRAPE_DELAY", "0.1"))
 SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "100"))
 
 GZ_FILE = "/tmp/enhetsregisteret_alle.csv.gz"
-RAW_FILE = "/tmp/raw_responses.json"
+RAW_FILE = "/tmp/raw_responses.jsonl"
 PARSED_FILE = "/tmp/parsed_data.json"
 
 
@@ -114,19 +114,19 @@ def download_enhetsregisteret():
 
 
 # ═══════════════════════════════════════════════════════════════
-# Stage 1: COLLECT
+# Stage 1: COLLECT — JSONL streaming, O(batch_size) memory
 #
-# HTTP GET per orgnr. Store raw response with zero parsing.
-# Every orgnr gets a record regardless of outcome.
+# Each line in raw_responses.jsonl is one JSON record:
+#   {"orgnr": "...", "url": "...", "collected_at": "...",
+#    "http_status": 200, "rsc_payload": "...",
+#    "rsc_payload_raw": null, "error": null}
 #
-# Record schema:
-#   orgnr            str
-#   url              str
-#   collected_at     ISO timestamp
-#   http_status      int | null (null on connection failure)
-#   rsc_payloads     list[str]  decoded RSC push strings
-#   rsc_payloads_raw list[str]  undecoded payloads (decode failed)
-#   error            str | null
+# Only the data-bearing RSC payload is stored (the one
+# containing "rettsstiftelser":[). Page metadata payloads
+# are discarded.
+#
+# Memory during collection: only the set of already-scraped
+# orgnr keys (~10 bytes × N) plus the current batch buffer.
 # ═══════════════════════════════════════════════════════════════
 
 def collect_one(orgnr):
@@ -136,8 +136,8 @@ def collect_one(orgnr):
         "url": url,
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "http_status": None,
-        "rsc_payloads": [],
-        "rsc_payloads_raw": [],
+        "rsc_payload": None,
+        "rsc_payload_raw": None,
         "error": None,
     }
     try:
@@ -159,25 +159,42 @@ def collect_one(orgnr):
     )
 
     for payload in pushes:
-        if "rettsstiftelser" not in payload:
+        if '"rettsstiftelser":[' not in payload:
             continue
         try:
             decoded = json.loads('"' + payload + '"')
-            record["rsc_payloads"].append(decoded)
+            record["rsc_payload"] = decoded
         except (json.JSONDecodeError, ValueError):
-            record["rsc_payloads_raw"].append(payload)
+            record["rsc_payload_raw"] = payload
+        break
 
     return record
 
 
+def scan_existing_orgnr(jsonl_path):
+    already = set()
+    if not os.path.exists(jsonl_path):
+        return already
+    with open(jsonl_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                orgnr = json.loads(line)["orgnr"]
+                already.add(orgnr)
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return already
+
+
 def collect_all():
-    checkpoint_gcs = f"{GCS_PREFIX}/raw_responses.json"
-    if gcs_download(checkpoint_gcs, RAW_FILE):
-        with open(RAW_FILE, "r") as f:
-            raw_data = json.load(f)
-        update_status("collect", detail=f"Restored checkpoint: {len(raw_data)} orgnr")
-    else:
-        raw_data = {}
+    checkpoint_gcs = f"{GCS_PREFIX}/raw_responses.jsonl"
+    if not os.path.exists(RAW_FILE):
+        gcs_download(checkpoint_gcs, RAW_FILE)
+
+    already = scan_existing_orgnr(RAW_FILE)
+    update_status("collect", detail=f"Restored checkpoint: {len(already)} orgnr")
 
     target_orgnr = set()
     with gzip.open(GZ_FILE, "rt", encoding="utf-8") as f:
@@ -186,18 +203,20 @@ def collect_all():
             if row.get("forretningsadresse.kommunenummer") in KOMMUNENUMMER:
                 target_orgnr.add(row["organisasjonsnummer"])
 
-    already = set(raw_data.keys())
     remaining = sorted(target_orgnr - already)
     total_target = len(target_orgnr)
     update_status("collect", progress=f"{len(already)}/{total_target}",
                   detail=f"Remaining: {len(remaining)}")
 
+    batch = []
     for i, orgnr in enumerate(remaining, 1):
-        raw_data[orgnr] = collect_one(orgnr)
+        record = collect_one(orgnr)
+        batch.append(json.dumps(record, ensure_ascii=False))
 
         if i % SAVE_EVERY == 0:
-            with open(RAW_FILE, "w") as f:
-                json.dump(raw_data, f, ensure_ascii=False)
+            with open(RAW_FILE, "a") as f:
+                f.write("\n".join(batch) + "\n")
+            batch.clear()
             gcs_upload(RAW_FILE, checkpoint_gcs)
             done = len(already) + i
             update_status("collect", progress=f"{done}/{total_target}",
@@ -205,19 +224,20 @@ def collect_all():
 
         time.sleep(DELAY)
 
-    with open(RAW_FILE, "w") as f:
-        json.dump(raw_data, f, ensure_ascii=False)
-    gcs_upload(RAW_FILE, checkpoint_gcs)
-    update_status("collect", progress=f"{len(raw_data)}/{total_target}", detail="Complete")
-    return raw_data
+    if batch:
+        with open(RAW_FILE, "a") as f:
+            f.write("\n".join(batch) + "\n")
+        batch.clear()
+        gcs_upload(RAW_FILE, checkpoint_gcs)
+
+    update_status("collect", progress=f"{total_target}/{total_target}", detail="Complete")
 
 
 # ═══════════════════════════════════════════════════════════════
-# Stage 2: PARSE
+# Stage 2: PARSE — stream JSONL, build parsed output
 #
-# Operates entirely on stored rsc_payloads. No network access.
-# Parse failures are logged per-orgnr alongside the
-# successfully parsed data — they never prevent storage.
+# Reads raw_responses.jsonl line by line. Builds parsed_data.json
+# in memory (parsed entries are much smaller than raw payloads).
 # ═══════════════════════════════════════════════════════════════
 
 def extract_rettsstiftelser(rsc_payload):
@@ -302,71 +322,91 @@ def parse_entry(rs):
     return entry
 
 
-def parse_all(raw_data):
+def parse_record(record):
+    result = {
+        "orgnr": record["orgnr"],
+        "entries": [],
+        "entries_count": 0,
+        "raw_rettsstiftelser": [],
+        "url": record.get("url", ""),
+        "collected_at": record.get("collected_at", ""),
+        "collect_error": record.get("error"),
+        "parse_error": None,
+    }
+
+    if record.get("error"):
+        return result
+
+    payload = record.get("rsc_payload")
+    raw_payload = record.get("rsc_payload_raw")
+
+    # Also handle old multi-payload format for backward compatibility
+    payloads = record.get("rsc_payloads", [])
+    raw_payloads = record.get("rsc_payloads_raw", [])
+
+    sources = []
+    if payload:
+        sources.append(("decoded", payload))
+    for p in payloads:
+        sources.append(("decoded", p))
+    if raw_payload:
+        sources.append(("raw", raw_payload))
+    for p in raw_payloads:
+        sources.append(("raw", p))
+
+    for source_type, pl in sources:
+        try:
+            if source_type == "raw":
+                pl = json.loads('"' + pl + '"')
+            rettsstiftelser = extract_rettsstiftelser(pl)
+            if rettsstiftelser is None:
+                continue
+            result["raw_rettsstiftelser"] = rettsstiftelser
+            for rs in rettsstiftelser:
+                entry = parse_entry(rs)
+                if entry:
+                    result["entries"].append(entry)
+            result["entries_count"] = len(result["entries"])
+            break
+        except Exception as e:
+            result["parse_error"] = str(e)[:500]
+
+    return result
+
+
+def parse_all():
     update_status("parse", detail="Parsing raw responses")
     parsed = {}
     parse_errors = 0
+    collect_errors = 0
+    total = 0
 
-    for orgnr, record in raw_data.items():
-        result = {
-            "orgnr": orgnr,
-            "entries": [],
-            "entries_count": 0,
-            "raw_rettsstiftelser": [],
-            "url": record.get("url", ""),
-            "collected_at": record.get("collected_at", ""),
-            "collect_error": record.get("error"),
-            "parse_error": None,
-        }
-
-        if record.get("error"):
-            parsed[orgnr] = result
-            continue
-
-        for payload in record.get("rsc_payloads", []):
+    with open(RAW_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                rettsstiftelser = extract_rettsstiftelser(payload)
-                if rettsstiftelser is None:
-                    continue
-                result["raw_rettsstiftelser"] = rettsstiftelser
-                for rs in rettsstiftelser:
-                    entry = parse_entry(rs)
-                    if entry:
-                        result["entries"].append(entry)
-                result["entries_count"] = len(result["entries"])
-            except Exception as e:
-                result["parse_error"] = str(e)[:500]
-                parse_errors += 1
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-        for raw_payload in record.get("rsc_payloads_raw", []):
-            try:
-                decoded = json.loads('"' + raw_payload + '"')
-                rettsstiftelser = extract_rettsstiftelser(decoded)
-                if rettsstiftelser is None:
-                    continue
-                result["raw_rettsstiftelser"] = rettsstiftelser
-                for rs in rettsstiftelser:
-                    entry = parse_entry(rs)
-                    if entry:
-                        result["entries"].append(entry)
-                result["entries_count"] = len(result["entries"])
-            except Exception as e:
-                if not result["parse_error"]:
-                    result["parse_error"] = f"raw_fallback: {str(e)[:400]}"
-                parse_errors += 1
+            total += 1
+            result = parse_record(record)
+            parsed[result["orgnr"]] = result
 
-        parsed[orgnr] = result
+            if result.get("collect_error"):
+                collect_errors += 1
+            if result.get("parse_error"):
+                parse_errors += 1
 
     with open(PARSED_FILE, "w") as f:
         json.dump(parsed, f, ensure_ascii=False)
     gcs_upload(PARSED_FILE, f"{GCS_PREFIX}/parsed_data.json")
 
-    total = len(parsed)
     with_entries = sum(1 for v in parsed.values() if v["entries_count"] > 0)
-    collect_errors = sum(1 for v in parsed.values() if v.get("collect_error"))
-    p_errors = sum(1 for v in parsed.values() if v.get("parse_error"))
     update_status("parse", progress=f"{with_entries}/{total}",
-                  detail=f"collect_errors={collect_errors} parse_errors={p_errors}")
+                  detail=f"collect_errors={collect_errors} parse_errors={parse_errors}")
     return parsed
 
 
@@ -527,8 +567,8 @@ def main():
     try:
         update_status("starting")
         download_enhetsregisteret()
-        raw_data = collect_all()
-        parsed = parse_all(raw_data)
+        collect_all()
+        parsed = parse_all()
         export(parsed)
     except Exception as e:
         update_status("error", error=str(e))
