@@ -270,6 +270,10 @@ def collect_all():
 # ═══════════════════════════════════════════════════════════════
 
 def extract_rettsstiftelser(rsc_payload):
+    try:
+        rsc_payload = rsc_payload.encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
     match = re.search(r'"data":\s*(\{)', rsc_payload)
     if not match:
         return None
