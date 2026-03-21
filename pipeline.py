@@ -184,7 +184,7 @@ def collect_one(orgnr):
     )
 
     for payload in pushes:
-        if '"rettsstiftelser":[' not in payload:
+        if 'rettsstiftelser' not in payload:
             continue
         try:
             decoded = json.loads('"' + payload + '"')
@@ -206,8 +206,12 @@ def scan_existing_orgnr(jsonl_path):
             if not line:
                 continue
             try:
-                orgnr = json.loads(line)["orgnr"]
-                already.add(orgnr)
+                rec = json.loads(line)
+                orgnr = rec["orgnr"]
+                if rec.get("rsc_payload") is not None or rec.get("rsc_payload_raw") is not None:
+                    already.add(orgnr)
+                elif rec.get("error"):
+                    already.add(orgnr)
             except (json.JSONDecodeError, KeyError):
                 continue
     return already
