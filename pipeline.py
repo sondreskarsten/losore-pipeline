@@ -156,7 +156,7 @@ def collect_one(orgnr):
         resp.raise_for_status()
         if resp.headers.get("content-type", "").startswith("text/x-component"):
             record["method"] = "rsc"
-            for line in resp.text.split('\n'):
+            for line in resp.content.decode("utf-8").split('\n'):
                 if '"rettsstiftelser":[' in line:
                     record["rsc_payload"] = line
                     break
