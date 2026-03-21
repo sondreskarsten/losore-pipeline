@@ -31,8 +31,10 @@ RELEVANT_CATEGORIES = [
     "Pant i motorvogner, anleggsmaskiner og jernbanemateriell",
 ]
 
-DELAY = float(os.environ.get("SCRAPE_DELAY", "0.1"))
+DELAY = float(os.environ.get("SCRAPE_DELAY", "0.05"))
 SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "100"))
+ORGNR_MIN = os.environ.get("ORGNR_MIN", "")
+ORGNR_MAX = os.environ.get("ORGNR_MAX", "")
 
 GZ_FILE = "/tmp/enhetsregisteret_alle.csv.gz"
 RAW_FILE = "/tmp/raw_responses.jsonl"
@@ -230,7 +232,12 @@ def collect_all():
         reader = csv.DictReader(f)
         for row in reader:
             if row.get("forretningsadresse.kommunenummer") in KOMMUNENUMMER:
-                target_orgnr.add(row["organisasjonsnummer"])
+                orgnr = row["organisasjonsnummer"]
+                if ORGNR_MIN and orgnr < ORGNR_MIN:
+                    continue
+                if ORGNR_MAX and orgnr >= ORGNR_MAX:
+                    continue
+                target_orgnr.add(orgnr)
 
     remaining = sorted(target_orgnr - already)
     total_target = len(target_orgnr)
