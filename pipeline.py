@@ -440,7 +440,290 @@ def parse_all():
 
 
 # ═══════════════════════════════════════════════════════════════
-# Stage 3: EXPORT
+# Stage 3a: EXPORT ALL — structured flattened datasets per type
+#
+# Operates on raw_rettsstiftelser (full JSON). Data-driven:
+# discovers all rolle types, formuesgode fields, krav fields
+# from the data itself. Produces one sheet per entry type.
+# ═══════════════════════════════════════════════════════════════
+
+ROLLE_ADDRESS_FIELDS = [
+    ("kommune", "ustrukturertadresse.kommune.kommunenavn"),
+    ("kommunenr", "ustrukturertadresse.kommune.kommunenummer"),
+    ("postnr", "ustrukturertadresse.poststed.postnummer"),
+    ("poststed", "ustrukturertadresse.poststed.navn"),
+    ("adresse", "ustrukturertadresse.adresse"),
+]
+
+
+def _deep_get(obj, dotpath):
+    for key in dotpath.split("."):
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(key)
+    return obj
+
+
+def flatten_rettsstiftelse(rs, orgnr):
+    if not isinstance(rs, dict):
+        return None
+
+    row = {
+        "orgnr": orgnr,
+        "type": rs.get("typeBeskrivelse", ""),
+        "dokumentnummer": rs.get("dokumentnummer", ""),
+        "status": rs.get("statusBeskrivelse", ""),
+    }
+
+    ts = rs.get("innkomsttidspunkt", "")
+    if ts:
+        try:
+            p = datetime.fromisoformat(ts)
+            row["innkomst_dato"] = p.replace(tzinfo=None)
+            if p.hour or p.minute:
+                row["innkomst_kl"] = p.strftime("%H:%M")
+        except ValueError:
+            row["innkomst_dato"] = ts
+
+    bts = rs.get("beslutningstidspunkt", "")
+    if bts:
+        try:
+            p = datetime.fromisoformat(bts)
+            row["beslutningsdato"] = p.replace(tzinfo=None)
+        except ValueError:
+            row["beslutningsdato"] = bts
+
+    for rolle in rs.get("roller", []):
+        if not isinstance(rolle, dict):
+            continue
+        rt = rolle.get("rolletype", "").replace("rolletype.", "")
+        if not rt:
+            continue
+        ri = rolle.get("rolleinnehaver", {})
+        if not isinstance(ri, dict):
+            continue
+        row[f"{rt}_navn"] = ri.get("navn", "")
+        row[f"{rt}_orgnr"] = ri.get("organisasjonsnummer", "")
+        row[f"{rt}_aktortype"] = ri.get("aktorType", "")
+        for short, dotpath in ROLLE_ADDRESS_FIELDS:
+            val = _deep_get(ri, dotpath)
+            if isinstance(val, list):
+                val = ", ".join(str(v) for v in val if v)
+            if val:
+                row[f"{rt}_{short}"] = val
+        intl = ri.get("internasjonaladresse")
+        if isinstance(intl, dict):
+            row[f"{rt}_landkode"] = intl.get("landkode", "")
+            row[f"{rt}_intl_adresse"] = intl.get("friAdressetekst", "") or intl.get("adressenavn", "")
+
+    krav = rs.get("krav")
+    if isinstance(krav, dict):
+        belop_list = krav.get("belop", [])
+        if belop_list and isinstance(belop_list, list) and len(belop_list) > 0 and isinstance(belop_list[0], dict):
+            row["beløp"] = belop_list[0].get("belop")
+            row["valuta"] = belop_list[0].get("valuta", "")
+        row["krav_fordringer"] = krav.get("kravFordringerBeskrivelse", "")
+        row["krav_salgspant"] = krav.get("kravSalgspantBeskrivelse", "")
+
+    fgs = rs.get("formuesgoder", [])
+    fg_descs = []
+    for fi, fg in enumerate(fgs):
+        if not isinstance(fg, dict):
+            continue
+        desc = fg.get("typeBeskrivelse", "")
+        avg = fg.get("avgrensingTingsinnbegrepBeskrivelse", "")
+        if avg:
+            desc += f" : {avg}"
+        ident = fg.get("beskrivelse", "")
+        if ident:
+            desc += f" {ident}"
+        fg_descs.append(desc)
+
+        prefix = f"fg{fi+1}_"
+        row[f"{prefix}type"] = fg.get("typeBeskrivelse", "")
+        row[f"{prefix}avgrensing"] = fg.get("avgrensingTingsinnbegrepBeskrivelse", "")
+        row[f"{prefix}regnr"] = fg.get("registreringsnummerMotorvogn", "")
+        hist = fg.get("historiskRegistreringsnummerMotorvogn", [])
+        if isinstance(hist, list) and hist:
+            row[f"{prefix}hist_regnr"] = ", ".join(str(h) for h in hist)
+        row[f"{prefix}beskrivelse"] = fg.get("beskrivelse", "")
+        row[f"{prefix}merke"] = fg.get("uregistrertMotorvognMerke", "")
+        row[f"{prefix}aarsmodell"] = fg.get("uregistrertMotorvognAarsmodell", "")
+        row[f"{prefix}vin"] = fg.get("uregistrertMotorvognIdentifikasjonsnummer", "")
+        row[f"{prefix}identifiseringstype"] = fg.get("identifiseringstypeBeskrivelse", "")
+        row[f"{prefix}identifikator"] = fg.get("identifikator", "")
+        eierandel = fg.get("eierandel", {})
+        if isinstance(eierandel, dict) and eierandel.get("teller") is not None:
+            row[f"{prefix}eierandel"] = f"{eierandel['teller']}/{eierandel['nevner']}"
+        row[f"{prefix}avtaletype_fordring"] = fg.get("avtaletypeFordringBeskrivelse", "")
+        row[f"{prefix}org"] = fg.get("organisasjonsnummer", "")
+
+    row["formuesgoder_antall"] = len(fg_descs)
+    row["formuesgoder_beskrivelse"] = " | ".join(fg_descs) if fg_descs else ""
+
+    pvs = rs.get("prioritetsvikelser", [])
+    if pvs and isinstance(pvs, list):
+        pv_docs = []
+        for pv in pvs:
+            if isinstance(pv, dict) and pv.get("dokumentnummer"):
+                pv_docs.append(str(pv["dokumentnummer"]))
+        if pv_docs:
+            row["prioritetsvikelser_dok"] = ", ".join(pv_docs)
+
+    pts = rs.get("paategninger", [])
+    if pts and isinstance(pts, list):
+        pt_texts = [pt.get("paategning", "") for pt in pts if isinstance(pt, dict)]
+        if pt_texts:
+            row["påtegninger"] = " | ".join(pt_texts)
+
+    konkurs = rs.get("konkurs")
+    if isinstance(konkurs, dict):
+        row["er_tvangsavvikling"] = konkurs.get("erTvangsavviklingEllerTvangsopplosning", "")
+
+    return row
+
+
+def export_all(parsed):
+    update_status("export_all", detail="Building per-type datasets")
+
+    by_type = defaultdict(list)
+    for orgnr, d in parsed.items():
+        for rs in d.get("raw_rettsstiftelser", []):
+            row = flatten_rettsstiftelse(rs, orgnr)
+            if row:
+                by_type[row["type"]].append(row)
+
+    ENHET_FIELDS = [
+        "navn", "organisasjonsform.kode", "naeringskode1.kode", "naeringskode1.beskrivelse",
+        "antallAnsatte", "forretningsadresse.kommune", "forretningsadresse.postnummer",
+        "forretningsadresse.poststed", "stiftelsesdato", "sisteInnsendteAarsregnskap",
+        "konkurs", "underAvvikling", "erIKonsern",
+    ]
+    all_orgnr = set()
+    for rows in by_type.values():
+        for r in rows:
+            all_orgnr.add(r["orgnr"])
+
+    enhet_lookup = {}
+    with gzip.open(GZ_FILE, "rt", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            org = row.get("organisasjonsnummer")
+            if org in all_orgnr:
+                enhet_lookup[org] = {k: row.get(k, "") for k in ENHET_FIELDS}
+
+    for rows in by_type.values():
+        for r in rows:
+            enhet = enhet_lookup.get(r["orgnr"], {})
+            for k in ENHET_FIELDS:
+                val = enhet.get(k, "")
+                if k == "antallAnsatte" and val:
+                    try:
+                        val = int(val)
+                    except ValueError:
+                        pass
+                r[k] = val
+
+    enhet_cols = ["orgnr"] + ENHET_FIELDS
+    meta_cols = ["type", "dokumentnummer", "status", "innkomst_dato", "innkomst_kl", "beslutningsdato"]
+    krav_cols = ["beløp", "valuta", "krav_fordringer", "krav_salgspant"]
+    fg_summary_cols = ["formuesgoder_antall", "formuesgoder_beskrivelse"]
+    misc_cols = ["prioritetsvikelser_dok", "påtegninger", "er_tvangsavvikling"]
+
+    fmt = {
+        "beløp": '#,##0',
+        "innkomst_dato": "DD.MM.YYYY",
+        "beslutningsdato": "DD.MM.YYYY",
+        "innkomst_kl": "@",
+    }
+
+    total_rows = 0
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    for entry_type in sorted(by_type.keys(), key=lambda t: -len(by_type[t])):
+        rows = by_type[entry_type]
+
+        ROLLE_SUFFIXES = ["_intl_adresse", "_landkode", "_aktortype", "_kommunenr",
+                          "_kommune", "_poststed", "_postnr", "_adresse", "_orgnr", "_navn"]
+        rolle_keys = set()
+        fg_max = 0
+        for r in rows:
+            for k in r.keys():
+                for sfx in ROLLE_SUFFIXES:
+                    if k.endswith(sfx):
+                        rolle_keys.add(k[:-len(sfx)])
+                        break
+            for i in range(1, 20):
+                if f"fg{i}_type" in r and r[f"fg{i}_type"]:
+                    fg_max = max(fg_max, i)
+
+        rolle_types_ordered = sorted(rolle_keys, key=lambda rt: -sum(1 for r in rows if r.get(f"{rt}_navn")))
+        rolle_cols = []
+        for rt in rolle_types_ordered:
+            rolle_cols.extend([
+                f"{rt}_navn", f"{rt}_orgnr", f"{rt}_aktortype",
+                f"{rt}_kommune", f"{rt}_kommunenr", f"{rt}_postnr", f"{rt}_poststed", f"{rt}_adresse",
+                f"{rt}_landkode", f"{rt}_intl_adresse",
+            ])
+
+        fg_detail_cols = []
+        for i in range(1, fg_max + 1):
+            fg_detail_cols.extend([
+                f"fg{i}_type", f"fg{i}_avgrensing", f"fg{i}_regnr", f"fg{i}_hist_regnr",
+                f"fg{i}_beskrivelse", f"fg{i}_merke", f"fg{i}_aarsmodell", f"fg{i}_vin",
+                f"fg{i}_identifiseringstype", f"fg{i}_identifikator", f"fg{i}_eierandel",
+                f"fg{i}_avtaletype_fordring", f"fg{i}_org",
+            ])
+
+        all_cols = enhet_cols + meta_cols + rolle_cols + krav_cols + fg_summary_cols + fg_detail_cols + misc_cols
+        present_cols = [c for c in all_cols if any(r.get(c) not in (None, "", 0) for r in rows)]
+
+        sheet_name = entry_type[:31].replace("/", "-")
+        ws = wb.create_sheet(title=sheet_name)
+
+        hfont = Font(bold=True, size=10, name="Arial")
+        hfill = PatternFill("solid", fgColor="D9E1F2")
+        halign = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cfont = Font(size=10, name="Arial")
+
+        for ci, h in enumerate(present_cols, 1):
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font = hfont
+            c.fill = hfill
+            c.alignment = halign
+
+        for ri, row in enumerate(rows, 2):
+            for ci, h in enumerate(present_cols, 1):
+                c = ws.cell(row=ri, column=ci, value=row.get(h))
+                c.font = cfont
+
+        for col_name, nf in fmt.items():
+            if col_name in present_cols:
+                ci = present_cols.index(col_name) + 1
+                for ri in range(2, len(rows) + 2):
+                    ws.cell(row=ri, column=ci).number_format = nf
+
+        for ci, h in enumerate(present_cols, 1):
+            sample_lens = [len(str(ws.cell(row=ri, column=ci).value or ""))
+                           for ri in range(2, min(len(rows) + 2, 100))]
+            max_len = max([len(h)] + sample_lens) if sample_lens else len(h)
+            ws.column_dimensions[get_column_letter(ci)].width = min(max(10, max_len + 2), 40)
+
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = "A2"
+        total_rows += len(rows)
+
+    local_xlsx = "/tmp/output_all_types.xlsx"
+    wb.save(local_xlsx)
+    gcs_xlsx = f"{GCS_PREFIX}/output/rettsstiftelser_all.xlsx"
+    gcs_upload(local_xlsx, gcs_xlsx)
+    update_status("export_all", progress=f"{total_rows} rows, {len(by_type)} types",
+                  detail=f"gs://{BUCKET_NAME}/{gcs_xlsx}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Stage 3b: EXPORT FILTERED — Sparebanken Sør/Norge matches
 # ═══════════════════════════════════════════════════════════════
 
 def match_panthaver(entry):
@@ -598,6 +881,7 @@ def main():
         download_enhetsregisteret()
         collect_all()
         parsed = parse_all()
+        export_all(parsed)
         export(parsed)
     except Exception as e:
         update_status("error", error=str(e))
