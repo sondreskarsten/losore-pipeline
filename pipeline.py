@@ -139,7 +139,7 @@ def download_enhetsregisteret():
 #   error            str | null
 # ═══════════════════════════════════════════════════════════════
 
-def collect_one(orgnr):
+def collect_one(orgnr, session):
     url = f"https://rettsstiftelser.brreg.no/nb/oppslag/virksomhet/{orgnr}"
     record = {
         "orgnr": orgnr,
@@ -153,7 +153,7 @@ def collect_one(orgnr):
     }
 
     try:
-        resp = requests.get(url, headers={"Rsc": "1"}, timeout=30)
+        resp = session.get(url, headers={"Rsc": "1"}, timeout=30)
         record["http_status"] = resp.status_code
         resp.raise_for_status()
         if resp.headers.get("content-type", "").startswith("text/x-component"):
@@ -168,7 +168,7 @@ def collect_one(orgnr):
 
     record["method"] = "html"
     try:
-        resp = requests.get(url, timeout=30)
+        resp = session.get(url, timeout=30)
         record["http_status"] = resp.status_code
         resp.raise_for_status()
     except requests.exceptions.Timeout:
@@ -244,9 +244,15 @@ def collect_all():
     update_status("collect", progress=f"{len(already)}/{total_target}",
                   detail=f"Remaining: {len(remaining)}")
 
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "SparebankenNorge-LosoreAnalyse/1.0 (+https://sparebanken.no)",
+        "Accept-Encoding": "gzip",
+    })
+
     batch = []
     for i, orgnr in enumerate(remaining, 1):
-        record = collect_one(orgnr)
+        record = collect_one(orgnr, session)
         batch.append(json.dumps(record, ensure_ascii=False))
 
         if i % SAVE_EVERY == 0:
