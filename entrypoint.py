@@ -28,7 +28,10 @@ from pipeline import collect_one, extract_rettsstiftelser, gcs_download, gcs_upl
 def parse_rs_from_response(rsc_payload):
     if not rsc_payload:
         return []
-    rs_list = extract_rettsstiftelser(rsc_payload)
+    try:
+        rs_list = extract_rettsstiftelser(rsc_payload)
+    except Exception:
+        return []
     return rs_list if rs_list else []
 
 

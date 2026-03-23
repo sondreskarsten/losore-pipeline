@@ -357,6 +357,7 @@ def bootstrap_from_jsonl(jsonl_dir):
     for jf in sorted(jsonl_files):
         region = os.path.basename(os.path.dirname(jf))
         count = 0
+        skipped = 0
         with open(jf) as fh:
             for line in fh:
                 line = line.strip()
@@ -370,14 +371,21 @@ def bootstrap_from_jsonl(jsonl_dir):
                 payload = rec.get("rsc_payload", "")
                 if not payload:
                     continue
-                rs_list = extract_rettsstiftelser(payload)
+                try:
+                    rs_list = extract_rettsstiftelser(payload)
+                except (json.JSONDecodeError, Exception):
+                    skipped += 1
+                    continue
                 if not rs_list:
                     continue
 
                 state.add_to_pool(orgnr, len(rs_list), source="initial_scrape", region=region)
                 state.backfill_orgnr(orgnr, rs_list)
                 count += 1
-        print(f"  {region}: {count:,} orgnr with RS", flush=True)
+        msg = f"  {region}: {count:,} orgnr with RS"
+        if skipped:
+            msg += f" ({skipped} skipped)"
+        print(msg, flush=True)
 
     state.save()
     summary = state.changelog_summary()
