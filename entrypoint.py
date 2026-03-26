@@ -17,6 +17,8 @@ SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "5000"))
 CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "10000"))
 GZ_FILE = "/tmp/enhetsregisteret_alle.csv.gz"
 
+EXCLUDE_ORGFORMS = {"ENK", "UTLA", "KBO", "SAM", "ANNA", "VPFO", "PK", "PERS", "ADOS", "STAT"}
+
 
 # ═══════════════════════════════════════════════════════════════
 # Reuse collect_one from pipeline.py
@@ -116,10 +118,6 @@ def run_daily():
 
 def load_all_orgnr():
     gz_path = f"losore/2026-03-21-agder/enhetsregisteret_alle.csv.gz"
-    prefixes = [
-        "losore/2026-03-21-telemark", "losore/2026-03-21-agder",
-        "losore/2026-03-21-trondelag", "losore/2026-03-21-rogaland",
-    ]
 
     from google.cloud import storage as gcs_lib
     client = gcs_lib.Client()
@@ -132,14 +130,33 @@ def load_all_orgnr():
             print(f"  Downloaded enhetsregisteret ({os.path.getsize(GZ_FILE)/1e6:.1f} MB)")
 
     orgnr_list = []
+    total_raw = 0
+    excluded_orgform = 0
+    excluded_not_foretak = 0
     with gzip.open(GZ_FILE, "rt", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            total_raw += 1
             orgnr = row.get("organisasjonsnummer", "")
-            if orgnr and len(orgnr) == 9:
-                orgnr_list.append(orgnr)
+            if not orgnr or len(orgnr) != 9:
+                continue
 
-    print(f"  Loaded {len(orgnr_list):,} orgnr from enhetsregisteret", flush=True)
+            orgform = row.get("organisasjonsform.kode", "")
+            if orgform in EXCLUDE_ORGFORMS:
+                excluded_orgform += 1
+                continue
+
+            foretak = row.get("registrertIForetaksregisteret", "").lower() in ("j", "true", "ja")
+            if not foretak:
+                excluded_not_foretak += 1
+                continue
+
+            orgnr_list.append(orgnr)
+
+    print(f"  Enhetsregisteret total:          {total_raw:,}", flush=True)
+    print(f"  Excluded orgform (Tier 1):       {excluded_orgform:,}  {EXCLUDE_ORGFORMS}", flush=True)
+    print(f"  Excluded not foretaksregisteret: {excluded_not_foretak:,}", flush=True)
+    print(f"  Remaining to scan:               {len(orgnr_list):,}  ({len(orgnr_list)/total_raw*100:.1f}%)", flush=True)
     return orgnr_list
 
 
