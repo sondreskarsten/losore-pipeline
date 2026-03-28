@@ -212,14 +212,7 @@ def collect_one(orgnr, session):
        extracts ``self.__next_f.push([1,"..."])`` payloads via regex.
        Requires ``json.loads`` to unescape JS string encoding.
 
-    .. warning::
-        As of March 2026, rettsstiftelser.brreg.no returns empty
-        ``rettsstiftelser:[]`` arrays for all orgnrs via both methods.
-        The site appears to have changed its data delivery mechanism.
-        The existing 310K document snapshots in GCS remain valid but
-        no new data can be collected until the source is investigated.
-
-    Parameters
+Parameters
     ----------
     orgnr : str
         9-digit Norwegian organisation number.

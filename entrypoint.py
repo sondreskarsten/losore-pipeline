@@ -114,11 +114,7 @@ def run_daily():
         "disappeared" events after 3 daily runs.  Fix: use
         ``result.get("rsc_payload", "")``.
 
-    .. warning::
-        **Data source offline**: rettsstiftelser.brreg.no returns
-        empty ``rettsstiftelser:[]`` for all orgnrs as of March 2026.
-        Even with the bug fixed, no new data would be collected.
-    """
+"""
     state = StateManager()
     state.load()
 
@@ -245,8 +241,8 @@ def run_weekly():
     delay per request, the full 481K scan takes ~7 hours.
 
     .. warning::
-        Same bugs as ``run_daily()``: ``collect_one()`` result is a
-        dict, not a string; rettsstiftelser.brreg.no returns empty data.
+        Same bug as ``run_daily()``: ``collect_one()`` result is a
+        dict, not a string.
     """
     state = StateManager()
     state.load()
