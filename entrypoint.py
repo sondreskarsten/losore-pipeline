@@ -105,16 +105,7 @@ def run_daily():
     rettsstiftelser via ``collect_one()``, diffs against stored
     snapshots via ``StateManager.diff_orgnr()``.  Saves state and
     changelog to GCS.
-
-    .. warning::
-        **Bug**: ``collect_one()`` returns a dict but this function
-        assigns ``rsc_payload = result if isinstance(result, str)``
-        which is always ``False``.  The RSC payload is never extracted.
-        All orgnrs appear to have 0 rettsstiftelser, causing false
-        "disappeared" events after 3 daily runs.  Fix: use
-        ``result.get("rsc_payload", "")``.
-
-"""
+    """
     state = StateManager()
     state.load()
 
@@ -136,7 +127,7 @@ def run_daily():
                 print(f"  {errors} errors so far, last: {e}", flush=True)
             continue
 
-        rsc_payload = result if isinstance(result, str) else ""
+        rsc_payload = result.get("rsc_payload", "") or ""
         rs_list = parse_rs_from_response(rsc_payload)
         changes = state.diff_orgnr(orgnr, rs_list, source="daily")
         state.update_pool_entry(orgnr, len(rs_list), len(changes) > 0)
@@ -239,10 +230,6 @@ def run_weekly():
 
     Checkpoints state to GCS every ``SAVE_EVERY`` records.  At 50ms
     delay per request, the full 481K scan takes ~7 hours.
-
-    .. warning::
-        Same bug as ``run_daily()``: ``collect_one()`` result is a
-        dict, not a string.
     """
     state = StateManager()
     state.load()
@@ -264,7 +251,7 @@ def run_weekly():
             errors += 1
             continue
 
-        rsc_payload = result if isinstance(result, str) else ""
+        rsc_payload = result.get("rsc_payload", "") or ""
         rs_list = parse_rs_from_response(rsc_payload)
 
         if rs_list and not state.is_in_pool(orgnr):
