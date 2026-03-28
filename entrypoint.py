@@ -28,6 +28,21 @@ from pipeline import collect_one, extract_rettsstiftelser, gcs_download, gcs_upl
 
 
 def parse_rs_from_response(rsc_payload):
+    """Extract rettsstiftelser list from an RSC payload string.
+
+    Wrapper around ``extract_rettsstiftelser()`` with exception
+    handling.  Returns empty list on any failure.
+
+    Parameters
+    ----------
+    rsc_payload : str
+        RSC flight stream line or decoded HTML push payload.
+
+    Returns
+    -------
+    list[dict]
+        Rettsstiftelser, or empty list on failure.
+    """
     if not rsc_payload:
         return []
     try:
@@ -38,6 +53,15 @@ def parse_rs_from_response(rsc_payload):
 
 
 def make_session():
+    """Create an HTTP session pre-configured for RSC endpoint.
+
+    Sets ``Rsc: 1`` and ``Accept: text/x-component`` headers so
+    the server returns the flight stream format directly.
+
+    Returns
+    -------
+    requests.Session
+    """
     session = requests.Session()
     session.headers.update({
         "User-Agent": "SparebankenNorge-LosoreAnalyse/2.0 (+https://sparebanken.no)",
@@ -48,6 +72,17 @@ def make_session():
 
 
 def update_status(phase, detail=None, stats=None):
+    """Write CDC-specific status to ``losore/state/cdc_status.json`` on GCS.
+
+    Parameters
+    ----------
+    phase : str
+        Current phase (``"collect"``, ``"saving"``, ``"done"``).
+    detail : str or None
+        Progress detail.
+    stats : dict or None
+        Changelog summary statistics.
+    """
     status = {
         "phase": phase,
         "detail": detail,
@@ -64,6 +99,26 @@ def update_status(phase, detail=None, stats=None):
 # ═══════════════════════════════════════════════════════════════
 
 def run_daily():
+    """Daily CDC mode: check all monitored orgnrs for changes.
+
+    Loads pool from GCS, iterates all ~92K orgnrs, collects current
+    rettsstiftelser via ``collect_one()``, diffs against stored
+    snapshots via ``StateManager.diff_orgnr()``.  Saves state and
+    changelog to GCS.
+
+    .. warning::
+        **Bug**: ``collect_one()`` returns a dict but this function
+        assigns ``rsc_payload = result if isinstance(result, str)``
+        which is always ``False``.  The RSC payload is never extracted.
+        All orgnrs appear to have 0 rettsstiftelser, causing false
+        "disappeared" events after 3 daily runs.  Fix: use
+        ``result.get("rsc_payload", "")``.
+
+    .. warning::
+        **Data source offline**: rettsstiftelser.brreg.no returns
+        empty ``rettsstiftelser:[]`` for all orgnrs as of March 2026.
+        Even with the bug fixed, no new data would be collected.
+    """
     state = StateManager()
     state.load()
 
@@ -117,6 +172,24 @@ def run_daily():
 # ═══════════════════════════════════════════════════════════════
 
 def load_all_orgnr():
+    """Load all eligible orgnrs from the enhetsregisteret CSV.
+
+    Downloads the bulk CSV from GCS (cached from a prior regional
+    scrape), filters out:
+
+    - Excluded org forms: ENK, UTLA, KBO, SAM, ANNA, VPFO, PK,
+      PERS, ADOS, STAT (sole proprietors, foreign entities,
+      municipalities, etc.)
+    - Entities not registered in Foretaksregisteret
+
+    Remaining ~481K orgnrs (~42% of the register) are the scrape
+    population for the weekly scan.
+
+    Returns
+    -------
+    list[str]
+        Sorted orgnrs to scan.
+    """
     gz_path = f"losore/2026-03-21-agder/enhetsregisteret_alle.csv.gz"
 
     from google.cloud import storage as gcs_lib
@@ -161,6 +234,20 @@ def load_all_orgnr():
 
 
 def run_weekly():
+    """Weekly CDC mode: scan full population for new orgnrs with rettsstiftelser.
+
+    Loads all eligible orgnrs from enhetsregisteret, scrapes each via
+    ``collect_one()``.  For orgnrs not yet in pool that have
+    rettsstiftelser, adds them to pool and backfills their documents.
+    For orgnrs already in pool, runs ``diff_orgnr()`` as daily does.
+
+    Checkpoints state to GCS every ``SAVE_EVERY`` records.  At 50ms
+    delay per request, the full 481K scan takes ~7 hours.
+
+    .. warning::
+        Same bugs as ``run_daily()``: ``collect_one()`` result is a
+        dict, not a string; rettsstiftelser.brreg.no returns empty data.
+    """
     state = StateManager()
     state.load()
 
@@ -224,6 +311,14 @@ def run_weekly():
 # ═══════════════════════════════════════════════════════════════
 
 def run_bootstrap():
+    """Bootstrap CDC state from existing regional scrape JSONL files.
+
+    Downloads all ``raw_responses.jsonl`` files from
+    ``gs://sondre_brreg_data/losore/2026-03-21-*/`` (16 regional
+    scrapes), passes to ``bootstrap_from_jsonl()`` which builds
+    the initial pool (~92K orgnrs) and snapshot index (~310K
+    documents).
+    """
     from google.cloud import storage as gcs_lib
     client = gcs_lib.Client()
     bucket = client.bucket(BUCKET)
@@ -254,6 +349,11 @@ def run_bootstrap():
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    """CDC entrypoint: dispatch to daily, weekly, or bootstrap mode.
+
+    Reads ``RUN_MODE`` env var.  Valid values: ``"daily"``,
+    ``"weekly"``, ``"bootstrap"``.
+    """
     print(f"{'='*60}", flush=True)
     print(f"  losore-pipeline CDC — mode: {RUN_MODE}", flush=True)
     print(f"  {datetime.now(timezone.utc).isoformat()}", flush=True)

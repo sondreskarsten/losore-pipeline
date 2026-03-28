@@ -46,10 +46,20 @@ PARSED_FILE = "/tmp/parsed_data.json"
 # ═══════════════════════════════════════════════════════════════
 
 def gcs_client():
+    """Return a google.cloud.storage.Client instance."""
     return storage.Client()
 
 
 def gcs_upload(local_path, gcs_path):
+    """Upload a local file to GCS.
+
+    Parameters
+    ----------
+    local_path : str
+        Local filesystem path to upload.
+    gcs_path : str
+        Full GCS object path (without ``gs://bucket/`` prefix).
+    """
     client = gcs_client()
     bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(gcs_path)
@@ -57,6 +67,20 @@ def gcs_upload(local_path, gcs_path):
 
 
 def gcs_download(gcs_path, local_path):
+    """Download a GCS object to a local file.
+
+    Parameters
+    ----------
+    gcs_path : str
+        GCS object path relative to ``BUCKET_NAME``.
+    local_path : str
+        Local destination path.
+
+    Returns
+    -------
+    bool
+        ``True`` if the blob existed and was downloaded, ``False`` otherwise.
+    """
     client = gcs_client()
     bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(gcs_path)
@@ -67,6 +91,15 @@ def gcs_download(gcs_path, local_path):
 
 
 def gcs_upload_json(data, gcs_path):
+    """Serialise a Python object to JSON and upload to GCS.
+
+    Parameters
+    ----------
+    data : dict or list
+        JSON-serialisable data.
+    gcs_path : str
+        GCS object path.
+    """
     client = gcs_client()
     bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(gcs_path)
@@ -74,6 +107,23 @@ def gcs_upload_json(data, gcs_path):
 
 
 def update_status(phase, progress=None, detail=None, error=None):
+    """Write pipeline status to ``{GCS_PREFIX}/status.json`` on GCS.
+
+    Called at every phase transition. Includes pipeline configuration
+    (bucket, prefix, kommunenummer, search terms) and timestamp.
+
+    Parameters
+    ----------
+    phase : str
+        Current phase (``"starting"``, ``"download"``, ``"collect"``,
+        ``"parse"``, ``"export"``, ``"done"``, ``"error"``).
+    progress : str or None
+        Numeric progress indicator (e.g. ``"500/1200"``).
+    detail : str or None
+        Human-readable detail message.
+    error : str or None
+        Error message if phase is ``"error"``.
+    """
     status = {
         "phase": phase,
         "progress": progress,
@@ -96,6 +146,15 @@ def update_status(phase, progress=None, detail=None, error=None):
 # ═══════════════════════════════════════════════════════════════
 
 def download_enhetsregisteret():
+    """Download the full enhetsregisteret CSV for kommune filtering.
+
+    Three-level cache: local file → GCS cache → brreg API download.
+    The ~152 MB gzipped CSV is used in stage 1 to filter orgnrs by
+    ``KOMMUNENUMMER`` and in stage 3 to enrich output with entity
+    metadata (name, legal form, NACE code, employees).
+
+    Downloads from ``https://data.brreg.no/enhetsregisteret/api/enheter/lastned/csv``.
+    """
     if os.path.exists(GZ_FILE):
         update_status("download", detail="Using cached local file")
         return
@@ -140,6 +199,41 @@ def download_enhetsregisteret():
 # ═══════════════════════════════════════════════════════════════
 
 def collect_one(orgnr, session):
+    """Collect løsøreregisteret data for one orgnr.
+
+    Two-strategy collection:
+
+    1. **RSC endpoint** (primary): sends ``Rsc: 1`` header to get
+       React Server Component flight stream (``text/x-component``).
+       Searches for the line containing ``"rettsstiftelser":[``.
+       ~18% the size of full HTML, no JS unescape needed.
+
+    2. **HTML fallback**: if RSC fails, fetches the full page and
+       extracts ``self.__next_f.push([1,"..."])`` payloads via regex.
+       Requires ``json.loads`` to unescape JS string encoding.
+
+    .. warning::
+        As of March 2026, rettsstiftelser.brreg.no returns empty
+        ``rettsstiftelser:[]`` arrays for all orgnrs via both methods.
+        The site appears to have changed its data delivery mechanism.
+        The existing 310K document snapshots in GCS remain valid but
+        no new data can be collected until the source is investigated.
+
+    Parameters
+    ----------
+    orgnr : str
+        9-digit Norwegian organisation number.
+    session : requests.Session
+        HTTP session with connection pooling and user-agent header.
+
+    Returns
+    -------
+    dict
+        Record with keys: ``orgnr``, ``url``, ``collected_at``,
+        ``http_status``, ``rsc_payload`` (str or None),
+        ``rsc_payload_raw`` (str or None), ``method`` (``"rsc"`` or
+        ``"html"`` or None), ``error`` (str or None).
+    """
     url = f"https://rettsstiftelser.brreg.no/nb/oppslag/virksomhet/{orgnr}"
     record = {
         "orgnr": orgnr,
@@ -199,6 +293,22 @@ def collect_one(orgnr, session):
 
 
 def scan_existing_orgnr(jsonl_path):
+    """Scan a JSONL file and return orgnrs that have been collected.
+
+    Reads line by line, considers an orgnr "collected" if it has
+    a non-null ``rsc_payload``, ``rsc_payload_raw``, or ``error``.
+    Used for resume-on-restart: skip already-collected orgnrs.
+
+    Parameters
+    ----------
+    jsonl_path : str
+        Path to the raw_responses.jsonl file.
+
+    Returns
+    -------
+    set[str]
+        Orgnrs with existing collection records.
+    """
     already = set()
     if not os.path.exists(jsonl_path):
         return already
@@ -220,6 +330,17 @@ def scan_existing_orgnr(jsonl_path):
 
 
 def collect_all():
+    """Stage 1: collect løsøreregisteret data for all target orgnrs.
+
+    Filters the enhetsregisteret CSV by ``KOMMUNENUMMER``, optionally
+    by ``ORGNR_MIN``/``ORGNR_MAX``, then scrapes each orgnr via
+    ``collect_one()``.  Results stream to ``raw_responses.jsonl``
+    in append-only JSONL format.  Checkpoints to GCS every
+    ``SAVE_EVERY`` records for crash recovery.
+
+    Resume: reads existing JSONL on startup, skips already-collected
+    orgnrs via ``scan_existing_orgnr()``.
+    """
     checkpoint_gcs = f"{GCS_PREFIX}/raw_responses.jsonl"
     if not os.path.exists(RAW_FILE):
         gcs_download(checkpoint_gcs, RAW_FILE)
@@ -283,6 +404,29 @@ def collect_all():
 # ═══════════════════════════════════════════════════════════════
 
 def extract_rettsstiftelser(rsc_payload):
+    """Extract the rettsstiftelser array from an RSC payload string.
+
+    Handles encoding recovery: tries ``latin-1 → utf-8`` re-encoding
+    for payloads that were double-encoded during collection.  Parses
+    the ``"data":{...}`` JSON object via brace-depth counting (the
+    payload is not valid standalone JSON — it's a React flight stream
+    line with surrounding metadata).
+
+    Parameters
+    ----------
+    rsc_payload : str
+        Raw RSC flight stream line or decoded HTML push payload
+        containing ``"data":{"rettsstiftelser":[...]}``.
+
+    Returns
+    -------
+    list[dict] or None
+        List of rettsstiftelse dicts, or ``None`` if no data block
+        found.  Each dict has keys: ``dokumentnummer``,
+        ``typeBeskrivelse``, ``statusBeskrivelse``,
+        ``innkomsttidspunkt``, ``roller``, ``formuesgoder``, ``krav``,
+        ``paategninger``, ``prioritetsvikelser``, ``konkurs``.
+    """
     try:
         rsc_payload = rsc_payload.encode("latin-1").decode("utf-8")
     except (UnicodeDecodeError, UnicodeEncodeError):
@@ -303,6 +447,24 @@ def extract_rettsstiftelser(rsc_payload):
 
 
 def parse_entry(rs):
+    """Parse a single rettsstiftelse dict into a flat entry.
+
+    Extracts: title (``typeBeskrivelse``), document number, timestamp,
+    status, and for each rolle: panthaver/pantsetter/eier with name
+    and orgnr.  Formuesgoder are concatenated into a single string
+    with ``" | "`` separator.  Krav beløp is extracted as integer.
+    Påtegninger are concatenated.
+
+    Parameters
+    ----------
+    rs : dict
+        One rettsstiftelse from ``extract_rettsstiftelser()``.
+
+    Returns
+    -------
+    dict or None
+        Flat entry dict, or ``None`` if input is not a dict.
+    """
     if not isinstance(rs, dict):
         return None
 
@@ -369,6 +531,24 @@ def parse_entry(rs):
 
 
 def parse_record(record):
+    """Parse a raw collection record into structured entries.
+
+    Handles both current (``rsc_payload``) and legacy
+    (``rsc_payloads`` list) record formats.  Tries decoded payloads
+    first, falls back to ``rsc_payload_raw`` with JS unescape.
+
+    Parameters
+    ----------
+    record : dict
+        One line from ``raw_responses.jsonl``.
+
+    Returns
+    -------
+    dict
+        Parsed record with keys: ``orgnr``, ``entries`` (list),
+        ``entries_count``, ``raw_rettsstiftelser`` (list),
+        ``collect_error``, ``parse_error``.
+    """
     result = {
         "orgnr": record["orgnr"],
         "entries": [],
@@ -421,6 +601,17 @@ def parse_record(record):
 
 
 def parse_all():
+    """Stage 2: parse all raw responses into structured entries.
+
+    Reads ``raw_responses.jsonl``, calls ``parse_record()`` per line,
+    writes ``parsed_data.json`` (full dict keyed by orgnr).
+    Tracks collect_error and parse_error counts separately.
+
+    Returns
+    -------
+    dict[str, dict]
+        Mapping from orgnr to parsed record.
+    """
     update_status("parse", detail="Parsing raw responses")
     parsed = {}
     parse_errors = 0
@@ -474,6 +665,19 @@ ROLLE_ADDRESS_FIELDS = [
 
 
 def _deep_get(obj, dotpath):
+    """Navigate a nested dict via dot-separated path.
+
+    Parameters
+    ----------
+    obj : dict
+        Root object.
+    dotpath : str
+        Dot-separated key path (e.g. ``"ustrukturertadresse.kommune.kommunenavn"``).
+
+    Returns
+    -------
+    Any or None
+    """
     for key in dotpath.split("."):
         if not isinstance(obj, dict):
             return None
@@ -482,6 +686,27 @@ def _deep_get(obj, dotpath):
 
 
 def flatten_rettsstiftelse(rs, orgnr):
+    """Flatten a single rettsstiftelse into a wide row for Excel export.
+
+    Extracts all fields including: per-rolle address details (kommune,
+    postnr, adresse, international address), per-formuesgode details
+    (type, avgrensing, regnr, VIN, eierandel, avtaletype),
+    prioritetsvikelser, påtegninger, konkurs/tvangsavvikling flag.
+    Timestamps parsed to datetime objects for Excel date formatting.
+
+    Parameters
+    ----------
+    rs : dict
+        One rettsstiftelse from the raw JSON.
+    orgnr : str
+        Organisation number.
+
+    Returns
+    -------
+    dict or None
+        Wide row dict with dynamic columns per rolle type and
+        formuesgode index, or ``None`` if input is not a dict.
+    """
     if not isinstance(rs, dict):
         return None
 
@@ -601,6 +826,21 @@ def flatten_rettsstiftelse(rs, orgnr):
 
 
 def export_all(parsed):
+    """Stage 3a: export all rettsstiftelser to a multi-sheet Excel file.
+
+    One sheet per entry type (e.g. ``"Pant i driftstilbehør"``,
+    ``"Utlegg"``), sorted by frequency.  Each sheet has entity
+    metadata from enhetsregisteret joined by orgnr.  Column layout:
+    entity fields → metadata → rolle details → krav → formuesgoder
+    summary → formuesgoder detail → misc.  Empty columns auto-removed.
+
+    Output: ``{GCS_PREFIX}/output/rettsstiftelser_all.xlsx``.
+
+    Parameters
+    ----------
+    parsed : dict[str, dict]
+        Output of ``parse_all()``.
+    """
     update_status("export_all", detail="Building per-type datasets")
 
     by_type = defaultdict(list)
@@ -744,11 +984,37 @@ def export_all(parsed):
 # ═══════════════════════════════════════════════════════════════
 
 def match_panthaver(entry):
+    """Test whether an entry's panthaver/eier matches search terms.
+
+    Parameters
+    ----------
+    entry : dict
+        Parsed entry from ``parse_entry()``.
+
+    Returns
+    -------
+    bool
+    """
     ph = entry.get("panthaver", "") or entry.get("eier", "")
     return any(t.lower() in ph.lower() for t in SEARCH_TERMS)
 
 
 def collect_rows(parsed):
+    """Filter parsed data for entries matching SEARCH_TERMS and RELEVANT_CATEGORIES.
+
+    Computes per-orgnr aggregates (total pant count and beløp for
+    the matching bank) alongside individual entry rows.
+
+    Parameters
+    ----------
+    parsed : dict[str, dict]
+        Output of ``parse_all()``.
+
+    Returns
+    -------
+    list[dict]
+        Flat rows ready for Excel export.
+    """
     belop_by_orgnr = defaultdict(int)
     count_by_orgnr = defaultdict(int)
     for orgnr, d in parsed.items():
@@ -802,6 +1068,27 @@ def collect_rows(parsed):
 
 
 def write_xlsx(rows, headers, output_file, fmt_map=None):
+    """Write rows to a formatted Excel file.
+
+    Applies header styling (bold, blue fill), number formatting per
+    ``fmt_map``, auto-column-width, autofilter, frozen header row.
+
+    Parameters
+    ----------
+    rows : list[dict]
+        Data rows.
+    headers : list[str]
+        Column order.
+    output_file : str
+        Local path to write .xlsx.
+    fmt_map : dict or None
+        Column name → Excel number format (e.g. ``'#,##0" NOK"'``).
+
+    Returns
+    -------
+    int
+        Number of rows written.
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "Løsøre"
@@ -836,6 +1123,18 @@ def write_xlsx(rows, headers, output_file, fmt_map=None):
 
 
 def export(parsed):
+    """Stage 3b: export filtered Sparebanken entries with entity enrichment.
+
+    Filters for ``SEARCH_TERMS`` × ``RELEVANT_CATEGORIES``, joins
+    enhetsregisteret metadata (name, legal form, NACE, employees,
+    address, bankruptcy status), writes formatted Excel to
+    ``{GCS_PREFIX}/output/sparebanken_enhet.xlsx``.
+
+    Parameters
+    ----------
+    parsed : dict[str, dict]
+        Output of ``parse_all()``.
+    """
     update_status("export", detail="Building xlsx")
     rows = collect_rows(parsed)
     fmt = {
@@ -893,6 +1192,11 @@ def export(parsed):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    """Pipeline entry point: download → collect → parse → export.
+
+    Runs all 4 stages sequentially.  On error, writes error status
+    to GCS before re-raising.
+    """
     try:
         update_status("starting")
         download_enhetsregisteret()

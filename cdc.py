@@ -64,6 +64,7 @@ _gcs_client = None
 
 
 def gcs():
+    """Return a cached google.cloud.storage.Client singleton."""
     global _gcs_client
     if _gcs_client is None:
         _gcs_client = storage.Client()
@@ -71,6 +72,20 @@ def gcs():
 
 
 def read_parquet_gcs(gcs_path, schema=None):
+    """Read a Parquet file from GCS into a PyArrow table.
+
+    Parameters
+    ----------
+    gcs_path : str
+        GCS object path relative to ``BUCKET``.
+    schema : pa.Schema or None
+        If the blob does not exist and schema is provided, returns
+        an empty table with the given schema.  If None, returns None.
+
+    Returns
+    -------
+    pa.Table or None
+    """
     bucket = gcs().bucket(BUCKET)
     blob = bucket.blob(gcs_path)
     if not blob.exists():
@@ -82,6 +97,15 @@ def read_parquet_gcs(gcs_path, schema=None):
 
 
 def write_parquet_gcs(table, gcs_path):
+    """Write a PyArrow table to GCS as zstd-compressed Parquet.
+
+    Parameters
+    ----------
+    table : pa.Table
+        Data to write.
+    gcs_path : str
+        GCS object path relative to ``BUCKET``.
+    """
     buf = io.BytesIO()
     pq.write_table(table, buf, compression="zstd", compression_level=3)
     bucket = gcs().bucket(BUCKET)
@@ -96,10 +120,40 @@ def write_parquet_gcs(table, gcs_path):
 # ═══════════════════════════════════════════════════════════════
 
 def canonical_json(obj):
+    """Serialise an object to deterministic JSON for hashing.
+
+    Sorted keys, no whitespace, no ASCII escaping. Used by
+    ``content_hash()`` to detect changes in rettsstiftelse documents.
+
+    Parameters
+    ----------
+    obj : dict or list
+        JSON-serialisable object.
+
+    Returns
+    -------
+    str
+    """
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def content_hash(obj):
+    """SHA-256 hex digest of a rettsstiftelse document.
+
+    Uses ``canonical_json()`` for deterministic serialisation so
+    that two dicts with different key ordering but identical content
+    produce the same hash.
+
+    Parameters
+    ----------
+    obj : dict
+        Rettsstiftelse document.
+
+    Returns
+    -------
+    str
+        64-character hex digest.
+    """
     return hashlib.sha256(canonical_json(obj).encode("utf-8")).hexdigest()
 
 
@@ -108,8 +162,23 @@ def content_hash(obj):
 # ═══════════════════════════════════════════════════════════════
 
 class StateManager:
+    """Manages løsøreregisteret CDC state: monitoring pool + document snapshots.
+
+    All state persisted as Parquet on GCS.  No databases, no migrations.
+    Three data structures:
+
+    - **Pool** (``pool.parquet``): orgnrs being monitored, with
+      discovery date, last checked/changed timestamps, and source.
+    - **Snapshots** (``snapshots.parquet``): per-document state keyed
+      by ``dokumentnummer``, with content hash for change detection,
+      full JSON for field-level diffing, absence counter for
+      disappearance detection.
+    - **Changelog**: append-only per-day Parquet files recording every
+      mutation (new, modified, disappeared, reappeared, backfill).
+    """
 
     def __init__(self):
+        """Initialise state manager with GCS paths and empty changelog."""
         self.pool_path = f"{STATE_PREFIX}/pool.parquet"
         self.snapshot_path = f"{STATE_PREFIX}/snapshots.parquet"
         self._pool = None
@@ -121,6 +190,11 @@ class StateManager:
         self._run_id = self._now.strftime("%Y%m%dT%H%M%S")
 
     def load(self):
+        """Load pool and snapshots from GCS Parquet into memory.
+
+        Builds in-memory indices: ``_pool_dict`` for O(1) orgnr lookup,
+        ``_snapshot_index`` for O(1) dokumentnummer lookup.
+        """
         print("Loading state...", flush=True)
         pool_table = read_parquet_gcs(self.pool_path, POOL_SCHEMA)
         self._pool = pool_table.to_pydict()
@@ -148,15 +222,26 @@ class StateManager:
         print(f"  snapshots: {len(self._snapshot_index):,} dokumentnummer", flush=True)
 
     def pool_orgnr_list(self):
+        """Return all monitored orgnrs as a list."""
         return list(self._pool["orgnr"])
 
     def pool_size(self):
+        """Return the number of monitored orgnrs."""
         return len(self._pool["orgnr"])
 
     def is_in_pool(self, orgnr):
+        """Check whether an orgnr is in the monitoring pool."""
         return orgnr in self._pool_dict
 
     def known_docs_for_orgnr(self, orgnr):
+        """Return all active snapshots for an orgnr.
+
+        Returns
+        -------
+        dict[str, dict]
+            Mapping from dokumentnummer to snapshot dict, filtered
+            to ``status == "active"`` only.
+        """
         return {
             k: v for k, v in self._snapshot_index.items()
             if v["orgnr"] == orgnr and v["status"] == "active"
@@ -165,6 +250,34 @@ class StateManager:
     # ─── CDC ────────────────────────────────────────────────────
 
     def diff_orgnr(self, orgnr, current_rs, source="daily"):
+        """Compare current rettsstiftelser against stored snapshots for one orgnr.
+
+        Three change categories detected:
+
+        - **new**: dokumentnummer not in snapshot index.
+        - **modified**: dokumentnummer exists but content hash differs.
+          Field-level diff via ``_find_changed_fields()`` recorded in
+          ``changed_fields``.
+        - **disappeared**: dokumentnummer in snapshot but not in current
+          response.  Increments ``absences`` counter; after 3 consecutive
+          absences, status changes to ``"disappeared"``.
+        - **reappeared**: dokumentnummer was ``"disappeared"`` but now
+          present again.
+
+        Parameters
+        ----------
+        orgnr : str
+            Organisation number.
+        current_rs : list[dict]
+            Current rettsstiftelser from ``extract_rettsstiftelser()``.
+        source : str
+            Event source label (``"daily"`` or ``"weekly"``).
+
+        Returns
+        -------
+        list[dict]
+            Changelog entries for this orgnr.
+        """
         current_docs = {}
         for rs in current_rs:
             dok = rs.get("dokumentnummer")
@@ -207,6 +320,17 @@ class StateManager:
         return changes
 
     def backfill_orgnr(self, orgnr, rettsstiftelser):
+        """Add historical rettsstiftelser to snapshots without change detection.
+
+        Used during bootstrap: all documents are inserted as new
+        snapshots with ``source="backfill"`` changelog entries.  Skips
+        documents already in the snapshot index (idempotent).
+
+        Parameters
+        ----------
+        orgnr : str
+        rettsstiftelser : list[dict]
+        """
         for rs in rettsstiftelser:
             dok = rs.get("dokumentnummer")
             if not dok or dok in self._snapshot_index:
@@ -220,6 +344,21 @@ class StateManager:
             ))
 
     def add_to_pool(self, orgnr, n_rs, source="weekly_discovery", region=None):
+        """Add an orgnr to the monitoring pool.
+
+        No-op if already in pool.  Sets ``discovered_date`` to today,
+        ``last_checked`` to now, ``last_changed`` to now if ``n_rs > 0``.
+
+        Parameters
+        ----------
+        orgnr : str
+        n_rs : int
+            Number of rettsstiftelser found.
+        source : str
+            Discovery source (``"weekly_discovery"``, ``"initial_scrape"``).
+        region : str or None
+            Geographic region label.
+        """
         if self.is_in_pool(orgnr):
             return
         idx = len(self._pool["orgnr"])
@@ -233,6 +372,16 @@ class StateManager:
         self._pool_dict[orgnr] = idx
 
     def update_pool_entry(self, orgnr, n_rs, had_changes):
+        """Update last_checked and optionally last_changed for a pool entry.
+
+        Parameters
+        ----------
+        orgnr : str
+        n_rs : int
+            Current rettsstiftelse count.
+        had_changes : bool
+            Whether any changelog entries were produced.
+        """
         idx = self._pool_dict.get(orgnr)
         if idx is None:
             return
@@ -244,6 +393,13 @@ class StateManager:
     # ─── Save ───────────────────────────────────────────────────
 
     def save(self):
+        """Write pool, snapshots, and changelog to GCS.
+
+        Writes pool and snapshots as full Parquet overwrites.
+        Changelog is written to ``{CHANGELOG_PREFIX}/{today}.parquet``
+        (one file per day, not append — subsequent saves on the same
+        day overwrite).
+        """
         print("Saving state...", flush=True)
 
         pool_table = pa.table(self._pool, schema=POOL_SCHEMA)
@@ -270,6 +426,7 @@ class StateManager:
         print(f"  snapshots: {len(self._snapshot_index):,} dokumentnummer", flush=True)
 
     def changelog_summary(self):
+        """Return a Counter of change_type values in the current changelog."""
         from collections import Counter
         types = Counter(c["change_type"] for c in self._changelog)
         return dict(types)
@@ -277,6 +434,7 @@ class StateManager:
     # ─── Internal ───────────────────────────────────────────────
 
     def _upsert_snapshot(self, dok, orgnr, h, rs):
+        """Insert or update a snapshot in the in-memory index."""
         existing = self._snapshot_index.get(dok)
         self._snapshot_index[dok] = {
             "dokumentnummer": dok,
@@ -291,6 +449,7 @@ class StateManager:
 
     def _make_change(self, change_type, orgnr, dok, rs=None, old_rs=None,
                      changed_fields=None, valid_time=None, source="daily"):
+        """Create a changelog entry dict conforming to CHANGELOG_SCHEMA."""
         vt = None
         if valid_time:
             try:
@@ -319,6 +478,23 @@ class StateManager:
         }
 
     def _find_changed_fields(self, old, new, prefix=""):
+        """Recursively compare two dicts, returning list of changed field paths.
+
+        Uses dot-notation for nested paths (e.g.
+        ``"roller.0.rolleinnehaver.navn"``).  Lists are compared via
+        canonical JSON serialisation.
+
+        Parameters
+        ----------
+        old, new : dict
+        prefix : str
+            Current path prefix for recursion.
+
+        Returns
+        -------
+        list[str]
+            Dot-separated field paths that differ.
+        """
         changed = []
         all_keys = set(list(old.keys()) + list(new.keys()))
         for key in sorted(all_keys):
@@ -340,6 +516,19 @@ class StateManager:
 # ═══════════════════════════════════════════════════════════════
 
 def bootstrap_from_jsonl(jsonl_dir):
+    """Build initial pool and snapshots from existing raw_responses.jsonl files.
+
+    Walks ``jsonl_dir`` recursively for .jsonl files, extracts
+    rettsstiftelser from each record's ``rsc_payload`` via
+    ``extract_rettsstiftelser()``, adds orgnrs to pool and documents
+    to snapshots.  Writes changelog entries with ``source="backfill"``.
+
+    Parameters
+    ----------
+    jsonl_dir : str
+        Local directory containing region-subdirectories with
+        ``raw_responses.jsonl`` files from the pipeline.py scrape.
+    """
     import re
     from pipeline import extract_rettsstiftelser
 
