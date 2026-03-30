@@ -244,7 +244,7 @@ class StateManager:
         """
         return {
             k: v for k, v in self._snapshot_index.items()
-            if v["orgnr"] == orgnr and v["status"] == "active"
+            if v["orgnr"] == orgnr
         }
 
     # ─── CDC ────────────────────────────────────────────────────
@@ -312,7 +312,7 @@ class StateManager:
         for dok, snap in known.items():
             if dok not in current_docs:
                 snap["absences"] = snap["absences"] + 1
-                if snap["absences"] >= 3 and snap["status"] == "active":
+                if snap["absences"] == 3 and snap["status"] == "active":
                     snap["status"] = "disappeared"
                     changes.append(self._make_change("disappeared", orgnr, dok, source=source))
 
