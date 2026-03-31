@@ -314,7 +314,8 @@ class StateManager:
                 snap["absences"] = snap["absences"] + 1
                 if snap["absences"] == 3 and snap["status"] == "active":
                     snap["status"] = "disappeared"
-                    changes.append(self._make_change("disappeared", orgnr, dok, source=source))
+                    old_rs = json.loads(snap["full_json"]) if snap.get("full_json") else None
+                    changes.append(self._make_change("disappeared", orgnr, dok, old_rs=old_rs, source=source))
 
         self._changelog.extend(changes)
         return changes
