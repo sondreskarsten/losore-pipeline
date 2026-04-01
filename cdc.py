@@ -107,7 +107,8 @@ def write_parquet_gcs(table, gcs_path):
         GCS object path relative to ``BUCKET``.
     """
     buf = io.BytesIO()
-    pq.write_table(table, buf, compression="zstd", compression_level=3)
+    pq.write_table(table, buf, compression="zstd", compression_level=3,
+                   write_statistics=True, write_page_index=True)
     bucket = gcs().bucket(BUCKET)
     blob = bucket.blob(gcs_path)
     blob.upload_from_string(buf.getvalue(), content_type="application/octet-stream")
@@ -403,7 +404,7 @@ class StateManager:
         """
         print("Saving state...", flush=True)
 
-        pool_table = pa.table(self._pool, schema=POOL_SCHEMA)
+        pool_table = pa.table(self._pool, schema=POOL_SCHEMA).sort_by("orgnr")
         write_parquet_gcs(pool_table, self.pool_path)
 
         snap_rows = list(self._snapshot_index.values())
@@ -411,7 +412,7 @@ class StateManager:
             snap_table = pa.table(
                 {col: [r[col] for r in snap_rows] for col in SNAPSHOT_SCHEMA.names},
                 schema=SNAPSHOT_SCHEMA
-            )
+            ).sort_by("orgnr")
             write_parquet_gcs(snap_table, self.snapshot_path)
 
         if self._changelog:
