@@ -260,8 +260,7 @@ class StateManager:
           Field-level diff via ``_find_changed_fields()`` recorded in
           ``changed_fields``.
         - **disappeared**: dokumentnummer in snapshot but not in current
-          response.  Increments ``absences`` counter; after 3 consecutive
-          absences, status changes to ``"disappeared"``.
+          response.  Immediately marked as ``"disappeared"``.
         - **reappeared**: dokumentnummer was ``"disappeared"`` but now
           present again.
 
@@ -313,7 +312,7 @@ class StateManager:
         for dok, snap in known.items():
             if dok not in current_docs:
                 snap["absences"] = snap["absences"] + 1
-                if snap["absences"] == 3 and snap["status"] == "active":
+                if snap["status"] == "active":
                     snap["status"] = "disappeared"
                     old_rs = json.loads(snap["full_json"]) if snap.get("full_json") else None
                     changes.append(self._make_change("disappeared", orgnr, dok, old_rs=old_rs, source=source))
