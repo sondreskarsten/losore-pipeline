@@ -381,16 +381,73 @@ def run_bootstrap():
     update_status("done", "Bootstrap complete")
 
 
+def run_convert_bootstrap():
+    """Convert bootstrap JSONL files to per-orgnr raw/ + manifest/ format.
+
+    Processes each regional ``raw_responses.jsonl`` sequentially,
+    writing one ``losore/raw/2026-03-21/{orgnr}.json`` per record
+    and appending to ``losore/manifest/2026-03-21.jsonl``.
+    """
+    from google.cloud import storage as gcs_lib
+    client = gcs_lib.Client()
+    bucket = client.bucket(BUCKET)
+
+    date_str = "2026-03-21"
+    store = GCSStore(BUCKET)
+
+    blobs = sorted(
+        [b for b in bucket.list_blobs(prefix="losore/2026-03-21-")
+         if b.name.endswith("raw_responses.jsonl")],
+        key=lambda x: x.size
+    )
+
+    seen = set()
+    total = 0
+
+    for blob_ref in blobs:
+        region = blob_ref.name.split("/")[1]
+        blob_ref.reload()
+        print(f"\n{region} ({blob_ref.size/1e6:.0f} MB)", flush=True)
+
+        local_jsonl = f"/tmp/{region}.jsonl"
+        blob_ref.download_to_filename(local_jsonl)
+
+        count = 0
+        with open(local_jsonl) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                orgnr = rec.get("orgnr", "")
+                if not orgnr or orgnr in seen:
+                    continue
+                seen.add(orgnr)
+
+                store.buffer_raw(orgnr, date_str, rec)
+                count += 1
+
+                if count % SAVE_EVERY == 0:
+                    store.flush()
+                    print(f"  {count:,} flushed", flush=True)
+
+        store.flush()
+        os.remove(local_jsonl)
+        total += count
+        print(f"  {region}: {count:,} orgnr", flush=True)
+
+    update_status("done", f"Convert bootstrap complete: {total:,} orgnr → raw/{date_str}/")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    """CDC entrypoint: dispatch to daily, weekly, or bootstrap mode.
-
-    Reads ``RUN_MODE`` env var.  Valid values: ``"daily"``,
-    ``"weekly"``, ``"bootstrap"``.
-    """
+    """CDC entrypoint: dispatch to daily, weekly, bootstrap, or convert_bootstrap mode."""
     print(f"{'='*60}", flush=True)
     print(f"  losore-pipeline CDC — mode: {RUN_MODE}", flush=True)
     print(f"  {datetime.now(timezone.utc).isoformat()}", flush=True)
@@ -400,10 +457,11 @@ def main():
         "daily": run_daily,
         "weekly": run_weekly,
         "bootstrap": run_bootstrap,
+        "convert_bootstrap": run_convert_bootstrap,
     }
 
     if RUN_MODE not in dispatch:
-        print(f"Unknown RUN_MODE: {RUN_MODE}. Use: daily, weekly, bootstrap")
+        print(f"Unknown RUN_MODE: {RUN_MODE}. Use: {', '.join(dispatch)}")
         sys.exit(1)
 
     dispatch[RUN_MODE]()
