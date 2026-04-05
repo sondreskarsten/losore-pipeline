@@ -38,8 +38,6 @@ SNAPSHOT_SCHEMA = pa.schema([
     ("full_json", pa.large_string()),
     ("first_seen", pa.timestamp("ms", tz="UTC")),
     ("last_seen", pa.timestamp("ms", tz="UTC")),
-    ("status", pa.string()),
-    ("absences", pa.int32()),
 ])
 
 CHANGELOG_SCHEMA = pa.schema([
@@ -171,11 +169,10 @@ class StateManager:
     - **Pool** (``pool.parquet``): orgnrs being monitored, with
       discovery date, last checked/changed timestamps, and source.
     - **Snapshots** (``snapshots.parquet``): per-document state keyed
-      by ``dokumentnummer``, with content hash for change detection,
-      full JSON for field-level diffing, absence counter for
-      disappearance detection.
-    - **Changelog**: append-only per-day Parquet files recording every
-      mutation (new, modified, disappeared, reappeared, backfill).
+      by ``dokumentnummer``, with content hash for change detection
+      and full JSON for field-level diffing.
+    - **Changelog**: append-only per-day Parquet files recording
+      new and modified rettsstiftelser.
     """
 
     def __init__(self):
@@ -195,6 +192,8 @@ class StateManager:
 
         Builds in-memory indices: ``_pool_dict`` for O(1) orgnr lookup,
         ``_snapshot_index`` for O(1) dokumentnummer lookup.
+        Handles legacy files with extra columns (status, absences) by
+        selecting only current schema columns.
         """
         print("Loading state...", flush=True)
         pool_table = read_parquet_gcs(self.pool_path, POOL_SCHEMA)
@@ -206,7 +205,9 @@ class StateManager:
         print(f"  pool: {len(self._pool['orgnr']):,} orgnr", flush=True)
 
         snap_table = read_parquet_gcs(self.snapshot_path, SNAPSHOT_SCHEMA)
-        snap_dict = snap_table.to_pydict()
+        want_cols = [f.name for f in SNAPSHOT_SCHEMA]
+        have_cols = [c for c in want_cols if c in snap_table.column_names]
+        snap_dict = snap_table.select(have_cols).to_pydict()
         self._snapshot_index = {}
         for i in range(len(snap_dict["dokumentnummer"])):
             dok = snap_dict["dokumentnummer"][i]
@@ -217,8 +218,6 @@ class StateManager:
                 "full_json": snap_dict["full_json"][i],
                 "first_seen": snap_dict["first_seen"][i],
                 "last_seen": snap_dict["last_seen"][i],
-                "status": snap_dict["status"][i],
-                "absences": snap_dict["absences"][i],
             }
         print(f"  snapshots: {len(self._snapshot_index):,} dokumentnummer", flush=True)
 
@@ -253,25 +252,16 @@ class StateManager:
     def diff_orgnr(self, orgnr, current_rs, source="daily"):
         """Compare current rettsstiftelser against stored snapshots for one orgnr.
 
-        Three change categories detected:
+        Two change categories:
 
         - **new**: dokumentnummer not in snapshot index.
         - **modified**: dokumentnummer exists but content hash differs.
-          Field-level diff via ``_find_changed_fields()`` recorded in
-          ``changed_fields``.
-        - **disappeared**: dokumentnummer in snapshot but not in current
-          response.  Immediately marked as ``"disappeared"``.
-        - **reappeared**: dokumentnummer was ``"disappeared"`` but now
-          present again.
 
         Parameters
         ----------
         orgnr : str
-            Organisation number.
         current_rs : list[dict]
-            Current rettsstiftelser from ``extract_rettsstiftelser()``.
         source : str
-            Event source label (``"daily"`` or ``"weekly"``).
 
         Returns
         -------
@@ -284,7 +274,6 @@ class StateManager:
             if dok:
                 current_docs[dok] = rs
 
-        known = self.known_docs_for_orgnr(orgnr)
         changes = []
 
         for dok, rs in current_docs.items():
@@ -302,20 +291,7 @@ class StateManager:
                 ))
                 self._upsert_snapshot(dok, orgnr, h, rs)
             else:
-                snap = self._snapshot_index[dok]
-                snap["last_seen"] = self._now
-                snap["absences"] = 0
-                if snap["status"] == "disappeared":
-                    snap["status"] = "active"
-                    changes.append(self._make_change("reappeared", orgnr, dok, rs, source=source))
-
-        for dok, snap in known.items():
-            if dok not in current_docs:
-                snap["absences"] = snap["absences"] + 1
-                if snap["status"] == "active":
-                    snap["status"] = "disappeared"
-                    old_rs = json.loads(snap["full_json"]) if snap.get("full_json") else None
-                    changes.append(self._make_change("disappeared", orgnr, dok, old_rs=old_rs, source=source))
+                self._snapshot_index[dok]["last_seen"] = self._now
 
         self._changelog.extend(changes)
         return changes
@@ -444,8 +420,6 @@ class StateManager:
             "full_json": canonical_json(rs),
             "first_seen": existing["first_seen"] if existing else self._now,
             "last_seen": self._now,
-            "status": "active",
-            "absences": 0,
         }
 
     def _make_change(self, change_type, orgnr, dok, rs=None, old_rs=None,

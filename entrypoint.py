@@ -27,6 +27,44 @@ EXCLUDE_ORGFORMS = {"ENK", "UTLA", "KBO", "SAM", "ANNA", "VPFO", "PK", "PERS", "
 from pipeline import collect_one, extract_rettsstiftelser, gcs_download, gcs_upload_json
 
 
+RAW_PREFIX = os.environ.get("RAW_PREFIX", "losore/raw")
+RAW_FILE = "/tmp/raw_responses.jsonl"
+
+
+class RawArchiver:
+    """Append every collect_one response to a local JSONL file, upload to GCS on flush."""
+
+    def __init__(self, run_date=None, suffix=None):
+        self._date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._suffix = f"-{suffix}" if suffix else ""
+        self._path = RAW_FILE
+        if os.path.exists(self._path):
+            os.remove(self._path)
+        self._fh = open(self._path, "w")
+        self._count = 0
+
+    def write(self, record):
+        self._fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        self._count += 1
+
+    def flush_to_gcs(self):
+        self._fh.close()
+        if self._count == 0 or not os.path.exists(self._path):
+            return
+        gz_path = self._path + ".gz"
+        with open(self._path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+            f_out.writelines(f_in)
+        from google.cloud import storage as gcs_lib
+        client = gcs_lib.Client()
+        gcs_key = f"{RAW_PREFIX}/{self._date}{self._suffix}.jsonl.gz"
+        blob = client.bucket(BUCKET).blob(gcs_key)
+        blob.upload_from_filename(gz_path)
+        size_mb = os.path.getsize(gz_path) / 1e6
+        print(f"  raw archive: {gcs_key} ({size_mb:.1f} MB, {self._count:,} records)", flush=True)
+        os.remove(self._path)
+        os.remove(gz_path)
+
+
 def parse_rs_from_response(rsc_payload):
     """Extract rettsstiftelser list from an RSC payload string.
 
@@ -114,6 +152,7 @@ def run_daily():
     update_status("collect", f"Checking {total:,} monitored orgnr")
 
     session = make_session()
+    archive = RawArchiver()
     checked = 0
     errors = 0
     t0 = time.time()
@@ -127,6 +166,7 @@ def run_daily():
                 print(f"  {errors} errors so far, last: {e}", flush=True)
             continue
 
+        archive.write(result)
         rsc_payload = result.get("rsc_payload", "") or ""
         rs_list = parse_rs_from_response(rsc_payload)
         changes = state.diff_orgnr(orgnr, rs_list, source="daily")
@@ -149,6 +189,7 @@ def run_daily():
     elapsed = time.time() - t0
     update_status("saving", f"Checked {checked:,} in {elapsed/60:.1f}m, {errors} errors")
     state.save()
+    archive.flush_to_gcs()
 
     summary = state.changelog_summary()
     update_status("done", f"Daily complete: {summary}", summary)
@@ -272,6 +313,7 @@ def run_weekly():
     update_status("collect", f"Scanning {start_index:,}→{total:,} ({total-start_index:,} remaining)")
 
     session = make_session()
+    archive = RawArchiver(suffix=state._run_id)
     checked = 0
     errors = 0
     t0 = time.time()
@@ -284,6 +326,7 @@ def run_weekly():
             errors += 1
             continue
 
+        archive.write(result)
         rsc_payload = result.get("rsc_payload", "") or ""
         rs_list = parse_rs_from_response(rsc_payload)
 
@@ -314,6 +357,8 @@ def run_weekly():
 
         if checked % SAVE_EVERY == 0:
             state.save()
+            archive.flush_to_gcs()
+            archive = RawArchiver(suffix=f"{state._run_id}-{i+1}")
             save_weekly_cursor({
                 "next_index": i + 1,
                 "total": total,
@@ -324,6 +369,7 @@ def run_weekly():
     elapsed = time.time() - t0
     update_status("saving", f"Scanned {checked:,} in {elapsed/3600:.1f}h")
     state.save()
+    archive.flush_to_gcs()
     delete_weekly_cursor()
 
     summary = state.changelog_summary()
