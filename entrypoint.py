@@ -220,31 +220,64 @@ def load_all_orgnr():
     return orgnr_list
 
 
+CURSOR_PATH = "losore/state/weekly_cursor.json"
+
+
+def load_weekly_cursor():
+    from google.cloud import storage as gcs_lib
+    client = gcs_lib.Client()
+    blob = client.bucket(BUCKET).blob(CURSOR_PATH)
+    if not blob.exists():
+        return None
+    return json.loads(blob.download_as_text())
+
+
+def save_weekly_cursor(cursor):
+    gcs_upload_json(cursor, CURSOR_PATH)
+
+
+def delete_weekly_cursor():
+    from google.cloud import storage as gcs_lib
+    client = gcs_lib.Client()
+    blob = client.bucket(BUCKET).blob(CURSOR_PATH)
+    if blob.exists():
+        blob.delete()
+    print("  weekly cursor deleted", flush=True)
+
+
 def run_weekly():
     """Weekly CDC mode: scan full population for new orgnrs with rettsstiftelser.
 
-    Loads all eligible orgnrs from enhetsregisteret, scrapes each via
-    ``collect_one()``.  For orgnrs not yet in pool that have
-    rettsstiftelser, adds them to pool and backfills their documents.
-    For orgnrs already in pool, runs ``diff_orgnr()`` as daily does.
-
-    Checkpoints state to GCS every ``SAVE_EVERY`` records.  At 50ms
-    delay per request, the full 481K scan takes ~7 hours.
+    Resumable across multiple executions via a cursor file on GCS.
+    Each run picks up where the previous one left off until the full
+    population is scanned, then deletes the cursor.
     """
     state = StateManager()
     state.load()
 
     all_orgnr = load_all_orgnr()
     total = len(all_orgnr)
-    update_status("collect", f"Scanning full population: {total:,} orgnr")
+
+    cursor = load_weekly_cursor()
+    start_index = 0
+    new_discoveries = 0
+    if cursor and cursor.get("total") == total:
+        start_index = cursor.get("next_index", 0)
+        new_discoveries = cursor.get("new_discoveries", 0)
+        print(f"  Resuming from index {start_index:,}/{total:,} "
+              f"(prior discoveries: {new_discoveries:,})", flush=True)
+    elif cursor:
+        print(f"  Cursor stale (total mismatch {cursor.get('total')} vs {total}), starting fresh", flush=True)
+
+    update_status("collect", f"Scanning {start_index:,}→{total:,} ({total-start_index:,} remaining)")
 
     session = make_session()
     checked = 0
-    new_discoveries = 0
     errors = 0
     t0 = time.time()
 
-    for i, orgnr in enumerate(all_orgnr):
+    for i in range(start_index, total):
+        orgnr = all_orgnr[i]
         try:
             result = collect_one(orgnr, session)
         except Exception as e:
@@ -271,19 +304,27 @@ def run_weekly():
         if checked % 5000 == 0:
             elapsed = time.time() - t0
             rate = checked / elapsed
-            eta_h = (total - checked) / rate / 3600
-            print(f"  {checked:,}/{total:,}  ({rate:.1f}/s, ETA {eta_h:.1f}h)  "
+            remaining = total - (start_index + checked)
+            eta_h = remaining / rate / 3600
+            print(f"  {start_index+checked:,}/{total:,}  ({rate:.1f}/s, ETA {eta_h:.1f}h)  "
                   f"new: {new_discoveries:,}  changes: {len(state._changelog):,}", flush=True)
 
         if checked % CHECKPOINT_EVERY == 0:
-            update_status("collect", f"{checked:,}/{total:,} new:{new_discoveries}")
+            update_status("collect", f"{start_index+checked:,}/{total:,} new:{new_discoveries}")
 
         if checked % SAVE_EVERY == 0:
             state.save()
+            save_weekly_cursor({
+                "next_index": i + 1,
+                "total": total,
+                "new_discoveries": new_discoveries,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
 
     elapsed = time.time() - t0
     update_status("saving", f"Scanned {checked:,} in {elapsed/3600:.1f}h")
     state.save()
+    delete_weekly_cursor()
 
     summary = state.changelog_summary()
     update_status("done", f"Weekly complete: new={new_discoveries}, {summary}", summary)
