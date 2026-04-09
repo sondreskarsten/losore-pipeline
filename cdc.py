@@ -69,7 +69,7 @@ def gcs():
     return _gcs_client
 
 
-def read_parquet_gcs(gcs_path, schema=None):
+def read_parquet_gcs(gcs_path, schema=None, columns=None):
     """Read a Parquet file from GCS into a PyArrow table.
 
     Parameters
@@ -79,6 +79,8 @@ def read_parquet_gcs(gcs_path, schema=None):
     schema : pa.Schema or None
         If the blob does not exist and schema is provided, returns
         an empty table with the given schema.  If None, returns None.
+    columns : list[str] or None
+        If provided, read only these columns.
 
     Returns
     -------
@@ -91,7 +93,7 @@ def read_parquet_gcs(gcs_path, schema=None):
             return pa.table({f.name: pa.array([], type=f.type) for f in schema}, schema=schema)
         return None
     buf = blob.download_as_bytes()
-    return pq.read_table(io.BytesIO(buf))
+    return pq.read_table(io.BytesIO(buf), columns=columns)
 
 
 def write_parquet_gcs(table, gcs_path):
@@ -187,14 +189,22 @@ class StateManager:
         self._now = datetime.now(timezone.utc)
         self._run_id = self._now.strftime("%Y%m%dT%H%M%S")
 
-    def load(self):
+    def load(self, lightweight=False):
         """Load pool and snapshots from GCS Parquet into memory.
 
         Builds in-memory indices: ``_pool_dict`` for O(1) orgnr lookup,
         ``_snapshot_index`` for O(1) dokumentnummer lookup.
         Handles legacy files with extra columns (status, absences) by
         selecting only current schema columns.
+
+        Parameters
+        ----------
+        lightweight : bool
+            If True, skip loading ``full_json`` column from snapshots.
+            Saves ~300 MB for large snapshot files.  Modifications
+            detected during this session will lack field-level diffs.
         """
+        self._lightweight = lightweight
         print("Loading state...", flush=True)
         pool_table = read_parquet_gcs(self.pool_path, POOL_SCHEMA)
         self._pool = pool_table.to_pydict()
@@ -204,8 +214,11 @@ class StateManager:
         }
         print(f"  pool: {len(self._pool['orgnr']):,} orgnr", flush=True)
 
-        snap_table = read_parquet_gcs(self.snapshot_path, SNAPSHOT_SCHEMA)
-        want_cols = [f.name for f in SNAPSHOT_SCHEMA]
+        snap_cols = ["dokumentnummer", "orgnr", "content_hash", "first_seen", "last_seen"]
+        if not lightweight:
+            snap_cols.append("full_json")
+        snap_table = read_parquet_gcs(self.snapshot_path, SNAPSHOT_SCHEMA, columns=snap_cols)
+        want_cols = snap_cols
         have_cols = [c for c in want_cols if c in snap_table.column_names]
         snap_dict = snap_table.select(have_cols).to_pydict()
         self._snapshot_index = {}
@@ -215,11 +228,12 @@ class StateManager:
                 "dokumentnummer": dok,
                 "orgnr": snap_dict["orgnr"][i],
                 "content_hash": snap_dict["content_hash"][i],
-                "full_json": snap_dict["full_json"][i],
+                "full_json": snap_dict["full_json"][i] if "full_json" in snap_dict else None,
                 "first_seen": snap_dict["first_seen"][i],
                 "last_seen": snap_dict["last_seen"][i],
             }
-        print(f"  snapshots: {len(self._snapshot_index):,} dokumentnummer", flush=True)
+        mode_str = " (lightweight)" if lightweight else ""
+        print(f"  snapshots: {len(self._snapshot_index):,} dokumentnummer{mode_str}", flush=True)
 
     def pool_orgnr_list(self):
         """Return all monitored orgnrs as a list."""
@@ -283,8 +297,12 @@ class StateManager:
                 self._upsert_snapshot(dok, orgnr, h, rs)
             elif self._snapshot_index[dok]["content_hash"] != h:
                 old_json = self._snapshot_index[dok]["full_json"]
-                old_rs = json.loads(old_json) if old_json else {}
-                changed_fields = self._find_changed_fields(old_rs, rs)
+                if old_json:
+                    old_rs = json.loads(old_json)
+                    changed_fields = self._find_changed_fields(old_rs, rs)
+                else:
+                    old_rs = {}
+                    changed_fields = None
                 changes.append(self._make_change(
                     "modified", orgnr, dok, rs, old_rs=old_rs,
                     changed_fields=changed_fields, source=source
@@ -384,6 +402,16 @@ class StateManager:
 
         snap_rows = list(self._snapshot_index.values())
         if snap_rows:
+            if getattr(self, '_lightweight', False):
+                old = read_parquet_gcs(self.snapshot_path, columns=["dokumentnummer", "full_json"])
+                if old and old.num_rows > 0:
+                    old_d = old.to_pydict()
+                    old_json = {old_d["dokumentnummer"][i]: old_d["full_json"][i] for i in range(old.num_rows)}
+                    for snap in self._snapshot_index.values():
+                        if snap["full_json"] is None:
+                            snap["full_json"] = old_json.get(snap["dokumentnummer"])
+                    del old, old_d, old_json
+                    print(f"  merged full_json from old snapshots", flush=True)
             snap_table = pa.table(
                 {col: [r[col] for r in snap_rows] for col in SNAPSHOT_SCHEMA.names},
                 schema=SNAPSHOT_SCHEMA

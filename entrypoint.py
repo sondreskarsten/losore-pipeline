@@ -261,7 +261,7 @@ def run_weekly():
     population is scanned, then deletes the cursor.
     """
     state = StateManager()
-    state.load()
+    state.load(lightweight=True)
 
     all_orgnr = load_all_orgnr()
     total = len(all_orgnr)
