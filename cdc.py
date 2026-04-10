@@ -1,3 +1,43 @@
+"""CDC state manager for the løsøre (chattel lien) pipeline.
+
+Architecture: Pattern B — self-contained changelog with embedded values.
+
+Unlike the bulk-diff parsers (enheter, underenheter, roller) which write
+dated snapshots and use the changelog as a thin index, this pipeline has
+NO dated snapshots. The single mutable ``snapshots.parquet`` grows as new
+documents are discovered. Old/new values are embedded directly in the
+changelog via ``old_value`` and ``new_value`` columns (full JSON).
+
+State files on GCS::
+
+    losore/state/
+    ├── pool.parquet           — orgnrs being monitored (92K)
+    ├── snapshots.parquet      — one row per dokumentnummer (312K, with full_json)
+    └── cdc_status.json        — run metadata
+
+    losore/changelog/
+    └── YYYY-MM-DD.parquet     — daily changes (custom 10-column schema)
+
+Changelog schema (NOT the unified 12-column; requires adapter in unified-events)::
+
+    orgnr, dokumentnummer, change_type, changed_fields,
+    old_value, new_value, valid_time, detected_time, source, run_id
+
+The unified-events ``adapt_losore()`` adapter transforms this into the
+12-column schema by mapping dokumentnummer→document_id, change_type→event_type,
+and extracting summary from the JSON values.
+
+Change detection: per-orgnr, hash each rettsstiftelse's canonical JSON.
+Compare against stored hashes in snapshots.parquet. Three outcomes per
+dokumentnummer: new (not in snapshot), modified (hash differs), disappeared
+(in snapshot but not in current API response — 3 consecutive absences
+before marking disappeared).
+
+Run modes:
+    - daily: poll API for pool orgnrs, diff against snapshots
+    - weekly: full scan of 481K eligible orgnrs to discover new ones
+    - bootstrap: load from raw JSONL files (one-time)
+"""
 import hashlib
 import json
 import os

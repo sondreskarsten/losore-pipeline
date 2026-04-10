@@ -1,3 +1,26 @@
+"""Løsøreregisteret pipeline: collection + CDC in a single job.
+
+Unlike the bulk-diff parsers (enheter, underenheter, roller) where
+collection (brreg-downloader) and parsing are separate repos, this
+pipeline combines API collection and CDC in one job. It scrapes the
+løsøreregisteret API per orgnr, then diffs against stored state.
+
+This is a PATTERN B pipeline: no dated snapshots. The changelog embeds
+old/new values directly. snapshots.parquet is mutable (overwritten each run).
+
+Flow:
+  daily:   load pool → for each orgnr: fetch API → diff_orgnr() → changelog
+  weekly:  download enhetsregisteret CSV → filter eligible → scan all 481K
+           orgnrs → discover new ones → add to pool → diff
+  bootstrap: read raw JSONL from GCS → backfill_orgnr() → initial state
+
+Run modes via RUN_MODE env var:
+  daily    — poll known orgnrs (pool.parquet), write changelog
+  weekly   — full population scan, discover new orgnrs, diff all
+  bootstrap — one-time load from raw regional JSONL files
+
+Checkpoint: saves state every SAVE_EVERY (5000) orgnrs. Resumable on crash.
+"""
 import os
 import sys
 import csv
