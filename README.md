@@ -2,6 +2,21 @@
 
 Scrapes the Norwegian Register of Mortgages and Liens (Løsøreregisteret) for every company in the Enhetsregisteret. Tracks changes daily via CDC. Produces the **bank relationship map**: which company has liens, held by which creditor, for how much.
 
+## Overview
+
+| | |
+|---|---|
+| **What** | All registered security interests (pant) for Norwegian companies |
+| **LUAS** | (orgnr, dokumentnummer) — one lien registration per company |
+| **Schedule** | 02:00 Mon-Fri (daily), 00:00 Sat (weekly full scan) |
+| **Runtime** | ~2-4h daily, ~6-8h weekly |
+| **Input** | Løsøreregisteret Blazor web app (RSC protocol, no API) |
+| **Output — state** | `losore/state/snapshots.parquet` — ~324K rows, ~32 MB (mutable) |
+| **Output — CDC** | `losore/changelog/{date}.parquet` — ~330 rows/day, ~65 KB |
+| **Output — pool** | `losore/state/pool.parquet` — ~320K orgnrs, ~0.7 MB |
+| **Downstream** | → fleet_panel (bank_segment column), portfolio analysis |
+
+
 ## Source
 
 Løsøreregisteret records all security interests (pant) in moveable assets registered against Norwegian companies. The data is served via a Blazor Server Component (RSC) web application — no API, no bulk download. This pipeline reverse-engineers the RSC push protocol to extract structured JSON from the web app.
