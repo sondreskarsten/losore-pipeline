@@ -502,6 +502,7 @@ class StateManager:
         elif rs:
             try:
                 vt = datetime.fromisoformat(
+                # REVIEW: valid_time = innkomsttidspunkt (document creation date). Correct for extensive (new). Wrong for intensive (modified) — creation date not modification date. See valid_time_audit.md
                     rs.get("innkomsttidspunkt", "").replace("Z", "+00:00")
                 )
             except (ValueError, AttributeError):
