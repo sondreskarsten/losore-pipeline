@@ -1,70 +1,91 @@
 # losore-pipeline
 
-Scrapes the Norwegian Register of Mortgages and Liens (Løsøreregisteret) for every company in the Enhetsregisteret, tracks changes daily, and produces a CDC changelog. This is how we know **which bank holds security interests in which company's assets**.
+Scrapes the Norwegian Register of Mortgages and Liens (Løsøreregisteret) for every company in the Enhetsregisteret. Tracks changes daily via CDC. Produces the **bank relationship map**: which company has liens, held by which creditor, for how much.
 
-## What is Løsøreregisteret?
+## Source
 
-When a Norwegian company pledges assets as loan collateral — vehicles, inventory, accounts receivable, machinery, or floating charges over all assets — the security interest is registered in Løsøreregisteret (administered by Brønnøysund). It is a public register: anyone can look up any company and see every registered lien, who holds it, and for how much.
+Løsøreregisteret records all security interests (pant) in moveable assets registered against Norwegian companies. The data is served via a Blazor Server Component (RSC) web application — no API, no bulk download. This pipeline reverse-engineers the RSC push protocol to extract structured JSON from the web app.
 
-Each entry (rettsstiftelse) contains:
-- **The debtor** (pantsetter): the company whose assets are pledged
-- **The creditor** (rettighetshaver): the bank or leasing company holding the lien
-- **The amount** (krav.belop): the maximum secured claim
-- **The asset type** (formuesgodetype): what's pledged — vehicles, inventory, receivables, floating charge
-- **Registration date** (innkomsttidspunkt): when the lien was filed
-- **Status**: tinglyst (registered), slettet (cancelled), etc.
-- **Annotations** (påtegninger): free-text notes, often identifying the creditor for older entries
+## LUAS
 
-## Why does a credit analyst care?
+**(orgnr, dokumentnummer)**. One row in `snapshots.parquet` = one rettsstiftelse (registered security interest) for one company.
 
-This is the **bank relationship map**. From Løsøreregisteret you can answer:
+## Snapshots schema
 
-- **Which bank is the primary lender to this company?** The rettighetshaver with the largest belop (or the floating charge) is the main bank.
-- **Does the company bank with us (DNB) or a competitor?** Filter rettighetshaver by `orgnr = '984851006'` (DNB Bank ASA).
-- **Has the company recently taken on new secured debt?** A new rettsstiftelse = new lien = new borrowing. Visible from the CDC changelog as a `new` event.
-- **Has a lien been cancelled?** A `disappeared` event on a rettsstiftelse means the lien was slettet — possibly because the loan was repaid, refinanced, or the asset was sold.
-- **What's the total secured exposure?** Sum of belop across all active rettsstiftelser per orgnr gives the maximum secured claim. This is a floor on the company's total debt (unsecured debt is not in this register).
-- **Portfolio segmentation**: by joining rettighetshaver.orgnr to the fleet panel, we segment fishing vessels into "DNB customer", "other bank", and "no lien" — revealing market share, exposure concentration, and relative portfolio quality.
+| Column | Type | Description |
+|---|---|---|
+| `dokumentnummer` | string | Unique lien registration number |
+| `orgnr` | string | Company bearing the lien (the debtor) |
+| `content_hash` | string | SHA256 of full_json for change detection |
+| `full_json` | large_string | Complete rettsstiftelse JSON (see structure below) |
+| `first_seen` | timestamp | When first observed |
+| `last_seen` | timestamp | When last confirmed present |
 
-## How collection works
+## Inside `full_json`
 
-Løsøreregisteret does not have a bulk download or a proper API. The data is served via a Blazor Server Component (RSC) web application that uses WebSocket-like push messages. This pipeline:
+The JSON contains the full rettsstiftelse as returned by the Blazor app. Key paths:
 
-1. **Establishes an RSC session** with the Løsøreregisteret web app
-2. **Sends search requests** per orgnr (one at a time, 0.05s delay)
-3. **Parses the RSC push payload** to extract rettsstiftelser JSON
-4. **Diffs against stored state** (Pattern B: previous state in mutable snapshots.parquet)
-5. **Writes changelog** for any changes (new, modified, disappeared rettsstiftelser)
+```
+$.roller[?(@.rollegruppetype=='rollegruppe.rett')].rolleinnehaver.navn          → creditor name (e.g., "DNB BANK ASA")
+$.roller[?(@.rollegruppetype=='rollegruppe.rett')].rolleinnehaver.organisasjonsnummer → creditor orgnr (e.g., "984851006")
+$.roller[?(@.rollegruppetype=='rollegruppe.forp')].rolleinnehaver.organisasjonsnummer → debtor orgnr
+$.krav.belop[0].belop                                                           → secured amount (NOK, integer)
+$.krav.belop[0].valuta                                                          → currency (almost always "NOK")
+$.formuesgoder[].type                                                           → asset type code
+$.formuesgoder[].typeBeskrivelse                                                → asset type description
+$.innkomsttidspunkt                                                             → registration date
+$.status                                                                        → "statusregistreringsobjekt.tl" (tinglyst = active)
+$.paategninger[]                                                                → annotation strings (older entries have "Panthaver: ..." here)
+```
 
-Three run modes:
-- **daily**: re-check all known orgnrs (from pool.parquet, ~320K orgnrs)
-- **weekly**: full population scan — download entire Enhetsregisteret CSV, filter eligible org forms, discover new orgnrs not yet in pool
-- **bootstrap**: one-time initial load from raw regional JSONL dumps
+**Gotcha**: older rettsstiftelser (pre-~2010) don't have structured `roller` arrays. The creditor name is buried in the `paategninger` (annotations) array as free text like `"Panthaver: Den norske Bank A/S."`. To get complete bank coverage, you must check both `roller[rollegruppe.rett]` AND parse paategninger text.
 
-## CDC shape (Pattern B)
+**Gotcha**: `belop` is the maximum secured claim, not the outstanding balance. A 50M NOK floating charge from 2005 may secure a loan that's been paid down to 5M. This is a ceiling, not a measurement.
 
-Unlike the bulk-diff parsers (enheter, roller) where changelogs are indexes into dated snapshots, the løsøre changelog embeds the actual JSON content. Each changelog row contains the full rettsstiftelse JSON in `details_json`, making it self-contained.
+## Bank segmentation
+
+To classify a company by bank relationship:
+
+```sql
+-- Extract creditor from roller JSON
+SELECT orgnr, dokumentnummer,
+  json_extract_string(rolle, '$.rolleinnehaver.organisasjonsnummer') AS bank_orgnr,
+  json_extract_string(rolle, '$.rolleinnehaver.navn') AS bank_name,
+  json_extract_string(full_json, '$.krav.belop[0].belop')::BIGINT AS belop_nok
+FROM snapshots,
+  LATERAL unnest(from_json(json_extract(full_json, '$.roller'), '["JSON"]')) AS rolle
+WHERE json_extract_string(rolle, '$.rollegruppetype') = 'rollegruppe.rett'
+```
+
+DNB group orgnrs: `984851006` (DNB Bank ASA), `816521432` (DNB Finans), `920953743` (DNB NOR Finans), `858043042` (DNB NOR Finans Bilfinans), `985621551` (DNB Boligkreditt), `914782007` (DNB Livsforsikring).
+
+## Cardinality
+
+- **Pool**: ~320K orgnrs monitored
+- **Snapshots**: ~324K active rettsstiftelser
+- **Top creditor**: DNB Bank ASA — 64,668 liens across 22,797 distinct orgnrs
+
+## CDC (Pattern B)
+
+Mutable snapshots — `snapshots.parquet` is overwritten each run. Changelog embeds old/new JSON in `details_json`, making it self-contained (no need to diff snapshots).
 
 ## GCS layout
 
 ```
 gs://sondre_brreg_data/losore/
-├── state/
-│   ├── pool.parquet              orgnr universe (~320K, mutable)
-│   └── snapshots.parquet         current state per (orgnr, dokumentnummer), mutable
-├── changelog/{date}.parquet      daily CDC events
-├── raw/                          regional JSONL dumps (bootstrap input)
-└── dimensions/                   lookup tables (formuesgodetype codes, etc.)
+├── state/pool.parquet              orgnr universe (mutable)
+├── state/snapshots.parquet         current state (mutable)
+├── changelog/{date}.parquet        daily CDC events
+└── dimensions/                     lookup tables
 ```
 
 ## Cloud Run
 
 - **Job**: `losore-cdc` (region: `europe-west4`)
-- **Schedule**: 02:00 Mon-Fri, 00:00 Saturday (weekly full scan)
-- **Runtime**: daily ~2-4h (320K orgnrs × 0.05s); weekly ~6-8h (481K orgnrs)
+- **Schedule**: 02:00 Mon-Fri (daily), 00:00 Sat (weekly full scan)
+- **Runtime**: daily ~2-4h (0.05s/orgnr × 320K), weekly ~6-8h
 
-## Downstream consumers
+## Downstream
 
-→ **fleet_panel**: rettighetshaver orgnr classifies vessels into bank segments (DNB / other / unknown)
-→ **integration-layer**: pending ledger admission (changelog schema compatible but adapter not yet wired)
-→ **portfolio monitor**: tracks new/cancelled liens as credit signals
+→ fleet_panel: `bank_segment` column (DNB only / DNB + other / Other bank / No lien)
+→ portfolio analysis: DNB lien exposure per vessel, per length group, per gear type
